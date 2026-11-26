@@ -2,6 +2,8 @@
 
 Subscribes: scan (LaserScan), odom (Odometry), /sar/route (Path from mission_manager)
 Publishes:  /sar/path (Path for local_driver), /sar/grid (OccupancyGrid, for rviz and mission_manager)
+Known-map mode (prior_map set): the grid starts from the saved course map, so A* routes around
+obstacles before the camera has seen them; what the camera sees overrides the map (core/grid.py).
 """
 import numpy as np
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
@@ -24,6 +26,11 @@ class PathPlanner(Node):
         res = float(U.param(self, 'grid_resolution', 0.1))
         size = float(U.param(self, 'grid_size', 46.0))
         self.grid = LiveGrid(-size / 2, -size / 2, size, res)
+        arena = U.arena_from_params(self)
+        prior = U.prior_from_params(self, arena)
+        if prior is not None:
+            n = self.grid.seed_prior(prior, arena)
+            self.get_logger().info('grid seeded from the prior map: %d obstacle cells' % n)
         self.max_range = float(U.param(self, 'grid_max_range', 5.0))
         self.planner = RoutePlanner(self.grid, coarse_factor=int(U.param(self, 'plan_coarse_factor', 2)),
                                     inflation=float(U.param(self, 'inflation', 0.4)))

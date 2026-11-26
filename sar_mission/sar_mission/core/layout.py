@@ -89,9 +89,50 @@ def generate(seed=0, n_obstacles=10, n_boards=8, search_min=5.0, search_max=15.0
         size = (3.0, 3.0)
     gates = dict((c, {'x': s[0], 'y': s[1], 'sx': size[0], 'sy': size[1]})
                  for c, s in zip(gate_colours, spots))
+    # star colours on the SAFE cards (current exit rule): a separate random stream, so obstacle and
+    # board positions stay the same as before for every seed
+    srng = np.random.RandomState(seed + 7919)
+    safes = [b for b in boards if b['cls'] == 'SAFE']
+    for b in safes:
+        b['star'] = str(srng.choice(list(gate_colours) + ['none']))
+    if safes and all(b['star'] == 'none' for b in safes):
+        safes[0]['star'] = str(gate_colours[srng.randint(len(gate_colours))])
     return {'seed': seed, 'arena': arena, 'search_min': search_min, 'search_max': search_max,
             'obstacles': obstacles, 'boards': boards, 'sign': sign, 'gates': gates,
             'gate_layout': gate_layout}
+
+
+def allowed_exits(layout):
+    """Exit colours the star rule allows for this layout."""
+    return sorted(set(b.get('star') for b in layout['boards']
+                      if b['cls'] == 'SAFE' and b.get('star') not in (None, 'none')))
+
+
+def rebuilt(layout, shift=0.2, turn_deg=8.0, seed=0, move_boards=False):
+    """The same course torn down and rebuilt: every obstacle moved by up to `shift` m (uniform in a
+    disc) and turned by up to turn_deg. Boards leaning on an obstacle move with it. Used to test
+    known-map mode against a prior map of the ORIGINAL layout."""
+    import copy
+    rng = np.random.RandomState(seed + 4242)
+    out = copy.deepcopy(layout)
+    moves = []
+    for o in out['obstacles']:
+        r = shift * math.sqrt(rng.rand())
+        a = rng.uniform(-math.pi, math.pi)
+        dx, dy = r * math.cos(a), r * math.sin(a)
+        o['x'] += dx
+        o['y'] += dy
+        o['yaw'] += math.radians(rng.uniform(-turn_deg, turn_deg))
+        moves.append((o, dx, dy))
+    for b in out['boards']:
+        if b.get('lean'):
+            near = min(moves, key=lambda m: math.hypot(m[0]['x'] - m[1] - b['x'], m[0]['y'] - m[2] - b['y']))
+            b['x'] += near[1]
+            b['y'] += near[2]
+        elif move_boards:
+            b['x'] += rng.uniform(-shift, shift)
+            b['y'] += rng.uniform(-shift, shift)
+    return out
 
 
 def save(layout, path):

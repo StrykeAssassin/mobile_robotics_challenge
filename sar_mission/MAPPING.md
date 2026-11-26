@@ -143,7 +143,9 @@ If it meets these, stop mapping and spend the rest of the session photographing 
 - `~/bags/mapping_run/`
 - `course_measurements.yaml` (below), plus photos of the course from each corner
 
-With these I'll add known-map mode: localization against this map, a precomputed search route from each of the 4 starts, and the measured exit points.
+These feed known-map mode (**KNOWN_MAP.md**): convert the iPad scan with `tools/ply_to_map.py`,
+compare it with this map using `tools/compare_maps.py --merged`, and launch the mission with
+`prior_map:=` and `course_file:=`.
 
 ## `course_measurements.yaml` template
 

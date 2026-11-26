@@ -127,7 +127,8 @@ class TargetTrackerNode(Node):
             for it in items:
                 if 'xyz' not in it:
                     continue
-                self._add(it['xyz'][:2], robot, self._probs(it), it.get('normal'), bool(it.get('back')))
+                self._add(it['xyz'][:2], robot, self._probs(it), it.get('normal'), bool(it.get('back')),
+                          it.get('star'))
             return
         # camera-frame boxes: need depth, intrinsics and the camera pose
         if self.depth is None or self.K is None:
@@ -153,7 +154,7 @@ class TargetTrackerNode(Node):
                 no = R @ nrm
                 if math.hypot(no[0], no[1]) > 0.5:         # roughly vertical board
                     n2 = (no[0], no[1])
-            self._add(p[:2], t[:2], self._probs(it), n2, bool(it.get('back')))
+            self._add(p[:2], t[:2], self._probs(it), n2, bool(it.get('back')), it.get('star'))
 
     @staticmethod
     def _probs(it):
@@ -163,11 +164,12 @@ class TargetTrackerNode(Node):
             return probs_from_label(it['label'], float(it.get('conf', 0.6)))
         return None
 
-    def _add(self, xy, robot_xy, probs, normal, back):
+    def _add(self, xy, robot_xy, probs, normal, back, star=None):
         ax, ay = self.arena.to_arena(xy[0], xy[1])
         if not self.arena.inside(ax, ay, margin=0.3):
             return            # geofence: ignore people/boards outside the arena
-        self.tracker.add(U.now_sec(self) - self.t0, xy, robot_xy, probs=probs, normal=normal, is_back=back)
+        self.tracker.add(U.now_sec(self) - self.t0, xy, robot_xy, probs=probs, normal=normal, is_back=back,
+                         star=star)
 
     # ---- outputs -------------------------------------------------------------------------------
     def publish(self):
@@ -180,7 +182,8 @@ class TargetTrackerNode(Node):
             cands.append({'id': t.id, 'x': float(t.xy[0]), 'y': float(t.xy[1]),
                           'nx': float(n[0]), 'ny': float(n[1])})
         rows = self.tracker.summary(self.arena.to_arena)
-        self.pub.publish(U.json_msg({'targets': rows, 'candidates': cands}))
+        self.pub.publish(U.json_msg({'targets': rows, 'candidates': cands,
+                                     'allowed_exits': self.tracker.allowed_exits()}))
         self.publish_markers()
 
     def publish_markers(self):
@@ -222,11 +225,11 @@ class TargetTrackerNode(Node):
         try:
             with open(tmp, 'w') as f:
                 w = csv.writer(f)
-                w.writerow(['id', 'class', 'confidence', 'confirmed', 'arena_x_m', 'arena_y_m', 'first_seen_s',
-                            'n_observations', 'written_at'])
+                w.writerow(['id', 'class', 'confidence', 'confirmed', 'arena_x_m', 'arena_y_m', 'star',
+                            'first_seen_s', 'n_observations', 'written_at'])
                 for r in rows:
                     w.writerow([r['id'], r['class'], r['confidence'], r['confirmed'], r['x'], r['y'],
-                                r['first_seen'], r['n_obs'], time.strftime('%H:%M:%S')])
+                                r.get('star') or '', r['first_seen'], r['n_obs'], time.strftime('%H:%M:%S')])
             os.replace(tmp, self.csv_path)
         except OSError as e:
             self.get_logger().warn('could not write %s: %s' % (self.csv_path, e), throttle_duration_sec=30.0)

@@ -85,6 +85,33 @@ class ColourVote(object):
         return {'colour': self.decided, 'confidence': round(conf, 2), 'votes': dict(self.totals)}
 
 
+class StarColours(object):
+    """Which exits are allowed: the star colours printed on the SAFE cards we found.
+
+    Rule (from the TA): seeing a red star allows the red exit; red and green stars allow either.
+    A colour counts once it has min_votes sightings (several frames, or a confirmed SAFE card from the
+    tracker, which adds `card_weight` votes). 'none' (a SAFE card without a star) allows nothing.
+    """
+
+    def __init__(self, min_votes=4, card_weight=6):
+        self.votes = {}
+        self.min_votes = min_votes
+        self.card_weight = card_weight
+
+    def add(self, colour, weight=1):
+        if colour in GATE_COLOURS:
+            self.votes[colour] = self.votes.get(colour, 0) + weight
+
+    def add_card(self, colour):
+        self.add(colour, self.card_weight)
+
+    def allowed(self):
+        return sorted(c for c, v in self.votes.items() if v >= self.min_votes)
+
+    def info(self):
+        return {'allowed': self.allowed(), 'star_votes': dict(self.votes)}
+
+
 class MatMap(object):
     """Accumulates floor points of each gate colour in a coarse odom grid and reports mat centres."""
 

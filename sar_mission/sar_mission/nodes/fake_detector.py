@@ -42,6 +42,7 @@ class FakeDetector(Node):
         self.sign_range = float(U.param(self, 'sign_range', 4.5))
         self.mat_range = float(U.param(self, 'mat_range', 3.5))
         self.cam_offset = float(U.param(self, 'camera_offset', 0.1))
+        self.exit_rule = U.param(self, 'exit_rule', 'stars')
         self.rng = np.random.RandomState(int(U.param(self, 'seed', 0)))
         self.odom = None
         self.create_subscription(Odometry, U.param(self, 'odom_topic', '/odom'), self.on_odom, U.SENSOR_QOS)
@@ -90,11 +91,24 @@ class FakeDetector(Node):
                 else:
                     lab = b['cls'] if self.rng.rand() > self.confusion else CONFUSABLE[b['cls']]
                     it['probs'] = probs_from_label(lab, 0.75)
+                    if lab == 'SAFE':      # star colour as the card matcher would read it
+                        it['star'] = b.get('star', 'none') if self.rng.rand() < 0.9 else 'none'
             items.append(it)
-        s = self.lay['sign']
-        d, in_fov = self._visible(cam, s['x'], s['y'])
-        if d < self.sign_range and in_fov and not L.occluded(self.segs, (ax, ay), (s['x'], s['y']), 0.9, 0.6):
-            items.append({'kind': 'exit_sign', 'colour': s['colour'] if self.rng.rand() < 0.85 else 'orange'})
+        if self.exit_rule == 'sign':
+            s = self.lay['sign']
+            d, in_fov = self._visible(cam, s['x'], s['y'])
+            if d < self.sign_range and in_fov and not L.occluded(self.segs, (ax, ay), (s['x'], s['y']), 0.9, 0.6):
+                items.append({'kind': 'exit_sign', 'colour': s['colour'] if self.rng.rand() < 0.85 else 'orange'})
+        else:
+            # star rule: the YOLO 'star' class = the star printed on a SAFE card, seen from the front
+            for b in self.lay['boards']:
+                if b['cls'] != 'SAFE' or b.get('star') in (None, 'none'):
+                    continue
+                d, in_fov = self._visible(cam, b['x'], b['y'])
+                view = wrap(math.atan2(ay - b['y'], ax - b['x']) - b['yaw'])
+                if d < 3.0 and in_fov and abs(view) < math.radians(70) and \
+                        not L.occluded(self.segs, (ax, ay), (b['x'], b['y']), L.BOARD_H, ignore=0.2):
+                    items.append({'kind': 'exit_sign', 'colour': b['star'] if self.rng.rand() < 0.85 else 'orange'})
         for c, g in self.lay['gates'].items():
             d, in_fov = self._visible(cam, g['x'], g['y'])
             if d < self.mat_range and in_fov:

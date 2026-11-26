@@ -22,15 +22,49 @@ def param(node, name, default):
     return node.get_parameter(name).value
 
 
+def course_from_params(node):
+    """course_measurements.yaml (core/course.py) if the course_file parameter is set, else None."""
+    path = str(param(node, 'course_file', '') or '')
+    if not path:
+        return None
+    from ..core.course import load_course
+    try:
+        return load_course(path)
+    except (OSError, KeyError, ValueError, TypeError) as e:
+        node.get_logger().error('could not read course_file %s: %s (using default positions)' % (path, e))
+        return None
+
+
 def arena_from_params(node):
     size = float(param(node, 'arena_size', 20.0))
     smin = float(param(node, 'search_min', 5.0))
     smax = float(param(node, 'search_max', 15.0))
-    corner = str(param(node, 'start_corner', 'SW'))
+    corner = str(param(node, 'start_corner', 'SW')).upper()
     heading = str(param(node, 'start_heading', 'edge'))
     inset = float(param(node, 'start_inset', 1.5))
     start = start_pose_from_corner(corner, size, inset, heading)
+    course = course_from_params(node)
+    if course and corner in course['starts']:
+        start = course['starts'][corner]          # the tape-measured start mark
     return ArenaFrame(start, size, smin, smax)
+
+
+def prior_from_params(node, arena):
+    """The saved course map (core/prior_map.PriorMap, arena frame) if prior_map is set, else None."""
+    path = str(param(node, 'prior_map', '') or '')
+    if not path:
+        return None
+    from ..core.prior_map import PriorMap
+    try:
+        pm = PriorMap.from_files(path, arena_size=arena.size,
+                                 res=float(param(node, 'prior_resolution', 0.05)))
+    except (OSError, KeyError, ValueError) as e:
+        node.get_logger().error('could not load prior_map %s: %s -> running WITHOUT the map' % (path, e))
+        return None
+    node.get_logger().info('prior map %s: %d obstacle cells, frame %s'
+                           % (path, int(pm.occ.sum()), pm.meta.get('frame', 'start corner %s'
+                                                                         % pm.meta.get('start_corner', '?'))))
+    return pm
 
 
 def now_sec(node):

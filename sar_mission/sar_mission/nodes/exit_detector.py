@@ -1,7 +1,7 @@
 """exit_detector: reads the exit-sign colour and maps the coloured floor mats / gate zones.
 
 Subscribes: RGB image, depth image + camera_info, /sar/floor (from depth_scan), /sar/detections
-Publishes:  /sar/exit (String JSON {"colour", "confidence", "votes"}),
+Publishes:  /sar/exit (String JSON {"colour", "confidence", "votes", "allowed", "star_votes"}),
             /sar/mats (String JSON {colour: [x, y, area]} in the odom frame),
             /sar/colour_debug (Image, optional)
 
@@ -21,7 +21,7 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 import tf2_ros
 
-from ..core.colour import ColourVote, GATE_COLOURS, MatMap, dominant_colour, hsv_masks
+from ..core.colour import ColourVote, GATE_COLOURS, MatMap, StarColours, dominant_colour, hsv_masks
 from . import ros_utils as U
 
 
@@ -44,6 +44,9 @@ class ExitDetector(Node):
                                min_votes=int(U.param(self, 'vote_min', 6)),
                                consecutive=int(U.param(self, 'vote_consecutive', 5)))
         self.mats = MatMap(cell=0.25, min_area=float(U.param(self, 'mat_min_area', 0.3)))
+        # star rule: every star colour seen often enough allows that exit (the tracker's confirmed
+        # SAFE cards are the main source; these per-frame star boxes are the backup)
+        self.stars = StarColours(min_votes=int(U.param(self, 'star_min_votes', 6)))
         self.K = None
         self.depth = None
         self.floor = None
@@ -88,6 +91,7 @@ class ExitDetector(Node):
         for it in d.get('items', []):
             if it.get('kind') == 'exit_sign' and it.get('colour'):
                 self.vote.add(it['colour'])                       # fake detector / colour already known
+                self.stars.add(it['colour'])
             elif it.get('kind') == 'exit_sign' and it.get('bbox'):
                 self.box_votes.append(it['bbox'])                 # colour read from the image in on_rgb
             elif it.get('kind') == 'mat' and it.get('xyz') and d.get('frame') == self.odom_frame:
@@ -111,6 +115,7 @@ class ExitDetector(Node):
                     c, _ = dominant_colour(cv2.cvtColor(np.ascontiguousarray(patch), cv2.COLOR_BGR2HSV),
                                            s_min=self.s_min, v_min=self.v_min)
                     self.vote.add(c)
+                    self.stars.add(c)
         small = np.ascontiguousarray(bgr[::self.step, ::self.step])
         hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
         masks = hsv_masks(hsv, s_min=self.s_min, v_min=self.v_min)
@@ -154,7 +159,9 @@ class ExitDetector(Node):
             self.debug_pub.publish(U.numpy_to_image_msg(vis, msg.header))
 
     def publish(self):
-        self.exit_pub.publish(U.json_msg(self.vote.info()))
+        info = self.vote.info()
+        info.update(self.stars.info())
+        self.exit_pub.publish(U.json_msg(info))
         mats = self.mats.mats()
         self.mats_pub.publish(U.json_msg(dict((c, [v[0], v[1], v[2]]) for c, v in mats.items())))
 

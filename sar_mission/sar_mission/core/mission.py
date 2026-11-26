@@ -4,7 +4,9 @@ Inputs each update (all positions in the odom frame):
   pose          Pose2D of the car
   candidates    boards that still need a close look: dicts {id, x, y, nx, ny}
   targets       tracker summary rows (dicts with 'class', 'confirmed')
-  exit_info     dict {'colour': str or None, 'confidence': float, 'votes': {colour: n}} or None
+  exit_info     dict or None. Star rule (current brief): {'allowed': [colours]} = star colours of the
+                SAFE cards found; the car leaves by the NEAREST allowed exit. Older sign rule:
+                {'colour': str or None, 'confidence': float, 'votes': {colour: n}}. Both may be present.
   mats          dict colour -> (x, y) of coloured floor mats seen so far (odom)
 Output: the route the planner should follow (list of odom points; [] = stop), plus events.
 
@@ -181,8 +183,11 @@ class MissionLogic(object):
         if self.state == EXIT:
             # refresh the gate if a better estimate arrived (colour decided, or the mat seen again:
             # a fresh sighting removes the odometry drift accumulated since it was first seen)
+            allowed = sorted((exit_info or {}).get('allowed') or [])
             if self.exit_colour is None or (exit_info and exit_info.get('colour')
-                                            and exit_info['colour'] != self.exit_colour):
+                                            and exit_info['colour'] != self.exit_colour
+                                            and not allowed) or \
+                    (allowed and allowed != getattr(self, 'exit_allowed', None)):
                 self._choose_gate(now, pose, exit_info, mats)
             elif self.exit_colour in mats:
                 mx, my = mats[self.exit_colour]
@@ -358,24 +363,46 @@ class MissionLogic(object):
 
     # --- exit -----------------------------------------------------------------------------
     def _shortcut_ok(self, exit_info, mats, targets):
-        if not exit_info or not exit_info.get('colour'):
+        if not exit_info:
             return False
-        if exit_info['colour'] not in mats and exit_info['colour'] not in self.gates_arena:
+        allowed = [c for c in (exit_info.get('allowed') or []) if c in mats or c in self.gates_arena]
+        colour = exit_info.get('colour')
+        if not allowed and not (colour and (colour in mats or colour in self.gates_arena)):
             return False
         confirmed = [r for r in targets if r.get('confirmed') and r.get('class') in TARGET_CLASSES]
         classes = set(r['class'] for r in confirmed)
         return len(confirmed) >= self.p.min_targets_for_shortcut and classes >= set(TARGET_CLASSES)
 
+    def _gate_xy(self, colour, mats):
+        if colour in mats:
+            return mats[colour], 'mat seen'
+        if colour in self.gates_arena:
+            return self.arena.to_odom(*self.gates_arena[colour]), 'mapped position'
+        return None, ''
+
     def _choose_gate(self, now, pose, exit_info, mats, quiet=False):
         colour = None
         how = ''
-        if exit_info and exit_info.get('colour'):
+        allowed = sorted((exit_info or {}).get('allowed') or [])
+        self.exit_allowed = allowed
+        options = []
+        for c in allowed:
+            xy, src = self._gate_xy(c, mats)
+            if xy is not None:
+                options.append((math.hypot(xy[0] - pose.x, xy[1] - pose.y), c, xy, src))
+        if options:
+            options.sort()
+            _, colour, (gx, gy), src = options[0]
+            how = 'nearest allowed exit (stars: %s), %s' % ('/'.join(allowed), src)
+        elif exit_info and exit_info.get('colour'):
             colour, how = exit_info['colour'], 'sign read'
         elif exit_info and exit_info.get('votes'):
             votes = exit_info['votes']
             if votes and max(votes.values()) > 0:
                 colour, how = max(votes, key=votes.get), 'most votes (sign not confirmed)'
-        if colour is not None and colour in mats:
+        if options:
+            pass
+        elif colour is not None and colour in mats:
             gx, gy = mats[colour]
             how += ', mat seen'
         elif colour is not None and colour in self.gates_arena:

@@ -5,6 +5,11 @@ Same log-odds idea as our HW3 occupancy_grid_mapper.py, with two changes for thi
   * asymmetric update: occupied evidence is strong, free evidence is weak, so small obstacles
     (cones, like the HW3 pillars) don't get erased by a few free rays passing next to them.
 Unknown cells count as free for planning; the driver's reactive layer covers what the grid hasn't seen.
+
+Known-map mode (seed_prior): the saved course map pre-fills the grid, so the planner routes around
+obstacles before the camera has seen them. Prior obstacles are NOT sticky: the course is rebuilt
+every day, so a cell the camera sees empty clears quickly (prior_free_gain x the normal rate). As soon
+as the camera itself sees something in a cell, it becomes a normal live (sticky) cell.
 """
 import math
 
@@ -25,6 +30,26 @@ class LiveGrid(object):
         self.occ_threshold = occ_threshold
         self.open_range = open_range   # 'nothing seen' (+inf) rays only clear this far
         self.sticky = sticky           # occupied cells clear this much slower (thin boards, cones)
+        self.prior = None              # bool mask: occupancy that came only from the saved map
+        self.prior_free_gain = 1.5
+
+    def seed_prior(self, prior_map, arena, l_occ=1.4, l_free=-0.4):
+        """Pre-fill from a core.prior_map.PriorMap (arena frame). `arena` converts this grid's frame
+        (odom / start frame) to the arena frame. Returns the number of prior obstacle cells."""
+        from .prior_map import FREE, OCC
+        rr, cc = np.mgrid[0:self.n, 0:self.n]
+        ox, oy = self.to_xy(rr, cc)
+        s = arena.start
+        c, sn = math.cos(s.yaw), math.sin(s.yaw)
+        ax = s.x + c * ox - sn * oy
+        ay = s.y + sn * ox + c * oy
+        st = prior_map.lookup(ax, ay)
+        occ = st == OCC
+        free = st == FREE
+        self.L[free] = np.minimum(self.L[free], l_free)
+        self.L[occ] = np.maximum(self.L[occ], l_occ)
+        self.prior = occ.copy()
+        return int(occ.sum())
 
     # --- coordinates -------------------------------------------------------------------------
     def to_cell(self, x, y):
@@ -63,7 +88,10 @@ class LiveGrid(object):
         if np.any(ok):
             idx = np.unique(fr[ok] * self.n + fc[ok])
             cur = self.L.flat[idx]
-            self.L.flat[idx] = cur + np.where(cur > self.occ_threshold, self.sticky * self.l_free, self.l_free)
+            step = np.where(cur > self.occ_threshold, self.sticky * self.l_free, self.l_free)
+            if self.prior is not None:
+                step = np.where(self.prior.flat[idx], self.prior_free_gain * self.l_free, step)
+            self.L.flat[idx] = cur + step
 
         hx = pose.x + ca[hit] * r[hit]
         hy = pose.y + sa[hit] * r[hit]
@@ -72,6 +100,8 @@ class LiveGrid(object):
         if np.any(ok):
             idx = np.unique(hr[ok] * self.n + hc[ok])
             self.L.flat[idx] += self.l_occ
+            if self.prior is not None:
+                self.prior.flat[idx] = False       # seen by the camera now: a normal live cell
         np.clip(self.L, self.l_min, self.l_max, out=self.L)
 
     def occupied(self):

@@ -49,6 +49,7 @@ class Track(object):
         self.inspected = False
         self.inspect_attempts = 0
         self.sight_dirs = []       # unit vectors from target to robot at each sighting
+        self.star_votes = {}       # SAFE cards: star colour -> votes ('none' = no star)
         if normal is not None:
             self.add_axis(normal, 1.0)
 
@@ -92,6 +93,12 @@ class Track(object):
         c = max(pr, key=pr.get)
         return c, pr[c]
 
+    def star(self):
+        """Most voted star colour, or None if never read."""
+        if not self.star_votes:
+            return None
+        return max(self.star_votes, key=self.star_votes.get)
+
 
 class TargetTracker(object):
     def __init__(self, merge_radius=0.35, max_normal_diff_deg=60.0, accept_conf=0.7,
@@ -125,12 +132,13 @@ class TargetTracker(object):
                 best, best_d = t, d
         return best
 
-    def add(self, now, xy, robot_xy, probs=None, normal=None, is_back=False):
+    def add(self, now, xy, robot_xy, probs=None, normal=None, is_back=False, star=None):
         """Add one sighting.
 
         xy, robot_xy: odom frame. probs: dict class->prob (None if detect-only).
         normal: 2D unit vector of the board plane normal (either side), or None.
         is_back: the classifier saw the blank back of the board.
+        star: star colour read on this sighting (SAFE cards), 'none' for no star, None = not read.
         """
         xy = np.asarray(xy, dtype=float)
         rxy = np.asarray(robot_xy, dtype=float)
@@ -165,6 +173,8 @@ class TargetTracker(object):
             elif probs is not None:
                 t.side_vec += sight
         t.sight_dirs.append(sight)
+        if star and not is_back:
+            t.star_votes[star] = t.star_votes.get(star, 0) + 1
         if probs is not None and not is_back:
             v = np.array([max(probs.get(c, 0.0), EPS) for c in ALL_CLASSES])
             v /= v.sum()
@@ -198,6 +208,8 @@ class TargetTracker(object):
                     keep.axis_sum += drop.axis_sum
                     keep.side_vec += drop.side_vec
                     keep.seen_vec += drop.seen_vec
+                    for k, v in drop.star_votes.items():
+                        keep.star_votes[k] = keep.star_votes.get(k, 0) + v
                     self.tracks.remove(drop)
                     merged = True
                     break
@@ -257,6 +269,16 @@ class TargetTracker(object):
                 'id': t.id, 'class': c, 'confidence': round(float(p), 3),
                 'confirmed': bool(self.confirmed(t)), 'x': round(float(x), 2), 'y': round(float(y), 2),
                 'n_obs': t.n_obs, 'n_class_obs': t.n_class_obs, 'first_seen': round(t.first_seen, 1),
-                'inspected': t.inspected,
+                'inspected': t.inspected, 'star': t.star() if c == 'SAFE' else None,
             })
         return rows
+
+    def allowed_exits(self):
+        """Star colours of confirmed SAFE cards = the exits we may use."""
+        out = set()
+        for t in self.tracks:
+            if self.confirmed(t) and t.best()[0] == 'SAFE':
+                st = t.star()
+                if st and st != 'none':
+                    out.add(st)
+        return sorted(out)

@@ -11,7 +11,8 @@ setup(
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml', 'README.md', 'MAPPING.md']),
+        ('share/' + package_name, ['package.xml', 'README.md', 'MAPPING.md', 'KNOWN_MAP.md']),
+        (os.path.join('share', package_name, 'cards'), glob('cards/*.png') + glob('cards/*.jpg')),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'worlds'), glob('worlds/*.world') + glob('worlds/*.json')),
@@ -39,6 +40,8 @@ setup(
             'dataset_capture = sar_mission.nodes.dataset_capture:main',
             'auto_mapper = sar_mission.nodes.auto_mapper:main',
             'save_map = sar_mission.nodes.save_map:main',
+            'localizer = sar_mission.nodes.localizer:main',
+            'map_diff = sar_mission.nodes.map_diff:main',
         ],
     },
 )

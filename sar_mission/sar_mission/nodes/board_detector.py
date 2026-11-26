@@ -5,14 +5,21 @@
   * optional classifier (classifier_path): run on each board crop that is at least
     classify_min_px tall; outputs SAFE / INJURED / HOSTAGE / THREAT / BACK / NOT_TARGET probabilities.
   * alternatively a single detector whose classes ARE the target classes (detector_gives_class:=true).
-Until the models are trained (needs photos of the real boards from the car's height, see
-tools/TRAINING.md) the node idles and logs a reminder; everything else still runs.
+Card matcher (core/card_matcher.py): reference photos of the actual cards (folder card_refs, files
+named CLASS[_STARCOLOUR]_*.png; the package ships the 12 photographed so far in cards/).
+  * with a detector: every card box at least match_min_px tall is matched against the references;
+    a good match sets the class (and, for SAFE cards, the star colour read from the image);
+  * without a detector model (not trained yet): the matcher searches whole frames itself at
+    matcher_rate Hz. It needs the card ~140 px tall or more (within ~2 m at 720p), which is what the
+    mission's inspection stops (1.2-1.5 m) give it.
 
 Output format: see core/perception.py (String JSON, works on Foxy and Humble).
 """
 import os
 
 import numpy as np
+
+from ..core.card_matcher import CardMatcher
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
@@ -68,12 +75,55 @@ class BoardDetector(Node):
         self.cls_net = self._load(os.path.expanduser(U.param(self, 'classifier_path', '~/sar_models/classifier.onnx')),
                                   required=False)
         self.last = 0.0
+        self.matcher = None
+        self.match_min_px = int(U.param(self, 'match_min_px', 90))
+        self.full_frame = bool(U.param(self, 'matcher_full_frame', True))
+        self.matcher_period = 1.0 / float(U.param(self, 'matcher_rate', 2.0))
+        if bool(U.param(self, 'use_matcher', True)):
+            ref_dir = os.path.expanduser(str(U.param(self, 'card_refs', '') or self._default_refs()))
+            try:
+                self.matcher = CardMatcher(ref_dir, min_inliers=int(U.param(self, 'match_min_inliers', 15)))
+                self.get_logger().info('card matcher: %d reference cards from %s' % (len(self.matcher), ref_dir))
+                if len(self.matcher) == 0:
+                    self.matcher = None
+            except Exception as e:   # noqa: BLE001 - cv2 missing ORB etc.
+                self.get_logger().warn('card matcher not available: %s' % e)
+                self.matcher = None
         self.pub = self.create_publisher(String, '/sar/detections', U.RELIABLE_QOS)
         self.create_subscription(Image, U.param(self, 'rgb_topic', '/zed/zed_node/rgb/image_rect_color'),
                                  self.on_image, U.SENSOR_QOS)
         if self.net is None:
-            self.create_timer(10.0, lambda: self.get_logger().warn(
-                'no detector model loaded: no board detections (see tools/TRAINING.md)'))
+            self.create_timer(30.0, lambda: self.get_logger().warn(
+                'no detector model loaded: %s' % ('card matcher searching whole frames'
+                                                  if (self.matcher and self.full_frame)
+                                                  else 'no board detections (see tools/TRAINING.md)')))
+
+    @staticmethod
+    def _default_refs():
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            return os.path.join(get_package_share_directory('sar_mission'), 'cards')
+        except Exception:   # noqa: BLE001
+            return '~/sar_models/cards'
+
+    def _matcher_only(self, msg, now):
+        """No detector model: find and classify cards with the reference matcher alone."""
+        if now - self.last < self.matcher_period:
+            return
+        self.last = now
+        img = np.ascontiguousarray(U.image_to_numpy(msg))
+        items = []
+        for m in self.matcher.find_all(img, max_cards=3):
+            bb = m.bbox()
+            if bb is None or bb[3] - bb[1] < self.match_min_px * 0.8:
+                continue
+            it = {'kind': 'board', 'bbox': bb, 'conf': m.conf, 'probs': m.probs(), 'source': 'matcher',
+                  'inliers': m.inliers}
+            if m.cls == 'SAFE':
+                it['star'] = m.star
+            items.append(it)
+        self.pub.publish(String(data=encode_detections(now, msg.header.frame_id, items,
+                                                       img.shape[1], img.shape[0])))
 
     def _load(self, path, required=True):
         if not os.path.exists(path):
@@ -93,7 +143,11 @@ class BoardDetector(Node):
 
     def on_image(self, msg):
         now = U.now_sec(self)
-        if self.net is None or now - self.last < self.min_period:
+        if self.net is None:
+            if self.matcher is not None and self.full_frame:
+                self._matcher_only(msg, now)
+            return
+        if now - self.last < self.min_period:
             return
         self.last = now
         import cv2
@@ -125,9 +179,36 @@ class BoardDetector(Node):
                 if probs is not None:
                     it['back'] = max(probs, key=probs.get) == 'BACK'
                     it['probs'] = dict((k2, v) for k2, v in probs.items() if k2 != 'BACK')
+            if it.get('kind') == 'board' and self.matcher is not None and (y2 - y1) >= self.match_min_px:
+                self._match(img, it, x1, y1, x2, y2)
             items.append(it)
         self.pub.publish(String(data=encode_detections(now, msg.header.frame_id, items,
                                                        img.shape[1], img.shape[0])))
+
+    def _match(self, img, it, x1, y1, x2, y2):
+        """Reference matching on the card box. A confident match decides the class (the classifier,
+        if any, only keeps a vote); SAFE matches add the star colour read from the image."""
+        h, w = img.shape[:2]
+        pad = 0.15 * (y2 - y1)
+        crop = img[int(max(0, y1 - pad)):int(min(h, y2 + pad)), int(max(0, x1 - pad)):int(min(w, x2 + pad))]
+        m = self.matcher.match(crop, want_corners=False)
+        if m is None:
+            return
+        mp = m.probs()
+        if it.get('probs'):
+            # weighted geometric blend: the matcher is trusted more the more inliers it had
+            a = m.conf
+            keys = set(mp) | set(it['probs'])
+            blend = dict((k, (max(mp.get(k, 1e-3), 1e-3) ** a) * (max(it['probs'].get(k, 1e-3), 1e-3) ** (1 - a)))
+                         for k in keys)
+            tot = sum(blend.values())
+            it['probs'] = dict((k, v / tot) for k, v in blend.items())
+        else:
+            it['probs'] = mp
+        it['match'] = {'cls': m.cls, 'inliers': m.inliers, 'ref': m.ref}
+        if m.cls == 'SAFE':
+            it['star'] = m.star
+        it['back'] = False
 
     def _classify(self, img, x1, y1, x2, y2):
         import cv2

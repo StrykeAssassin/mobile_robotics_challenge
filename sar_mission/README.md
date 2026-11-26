@@ -9,7 +9,13 @@ The plan is the Phase 1 "Lanes + Ring" strategy:
 1. Drive 3 lawnmower lanes through the 10 × 10 m search area.
 2. Drive a loop 3 m inside the arena edge.
 3. Go back to any board that was seen but not classified (mop-up).
-4. Drive to the gate matching the exit sign's colour.
+4. Drive to the nearest exit whose colour matches a star on a SAFE card found (`exit_rule: stars`; the
+   older single-exit-sign rule is still there as `exit_rule: sign`).
+
+**Known-map mode** (KNOWN_MAP.md): give the saved course map (`prior_map:=...`) and the robot localizes
+against it, plans around mapped obstacles, finds new objects by map difference and adds viewpoints
+where the map says the route can't see. Built for a course that is rebuilt every day (pieces moved
+10-30 cm).
 
 At each board the car stops 1.5 m in front of the printed side and classifies it over several frames. Targets are reported in the arena frame: origin at the SW corner, x east, y north, in metres.
 
@@ -36,6 +42,11 @@ ZED odom ───────────────────────�
 | `dataset_capture` | Saves camera frames for training YOLO. | — |
 | `auto_mapper` | Drives the course slowly for RTAB-Map. Runs corridor laps, criss-cross lanes and a reverse lap, then fills gaps. See **MAPPING.md**. | HW3 auto_explore idea |
 | `save_map` | Saves any OccupancyGrid topic (e.g. RTAB-Map's `/map`) as `.pgm` + `.yaml`. | — |
+| `localizer` | Known-map mode: particle filter, depth scan vs the saved map; publishes `/sar/odom` and TF `odom -> sar_map`. | HW4 MCL |
+| `map_diff` | Known-map mode: card-sized things that aren't in the saved map become targets to inspect. | — |
+
+Tools: `tools/ply_to_map.py` (iPad point cloud -> map), `tools/compare_maps.py` (iPad vs ZED or day vs
+day, merged map), card reference photos in `cards/` (used by `board_detector`'s card matcher).
 
 All the logic is in `sar_mission/core/` (plain Python + numpy, no ROS). The nodes in `sar_mission/nodes/` are thin wrappers, so the same code runs in the unit tests, the offline simulator, Gazebo and on the car.
 
@@ -43,7 +54,7 @@ All the logic is in `sar_mission/core/` (plain Python + numpy, no ROS). The node
 
 ```bash
 cd sar_mission
-python3 -m pytest -q test                          # 25 unit tests
+python3 -m pytest -q test                          # 35 unit tests
 python3 tools/offline_sim.py --seed 3 --plot run3.png -v
 python3 tools/offline_sim.py --seeds 0-19          # benchmark table
 python3 tools/offline_sim.py --seeds 0-9 --turn-radius 1.25 --lanes 4    # "what if" after day-1 tests
@@ -134,6 +145,6 @@ python3 tools/offline_mapper_sim.py --seed 3 --plot mapper.png   # try it offlin
 ## 5. Known limits
 
 - **YOLO isn't trained yet.** Until `~/sar_models/*.onnx` exist, the car searches, avoids obstacles and exits, but logs no targets. The exit sign is read from colour blobs meanwhile.
-- **Without reverse,** the car avoids clutter by predicting its arcs and by skipping viewpoints that are cluttered on the map. In a true dead end, after 15 s it makes short moves only along arcs that take it away from obstacles. A wonky car can still get boxed in between cards (2 of 10 simulated runs), which reverse or the planned known-map viewpoints would fix.
+- **Without reverse,** the car avoids clutter by predicting its arcs and by skipping viewpoints that are cluttered on the map. In a true dead end, after 15 s it makes short moves only along arcs that take it away from obstacles. A wonky car can still get boxed in between cards. In simulation with the star exit rule and a rebuilt course this cost about half the runs without reverse, and the map does not fix it; with reverse working, 7-8 of 10 runs exit correctly. **Test reverse on day 1.**
 - **Positions drift with ZED odometry,** about 1% of distance travelled. The exit gate is refreshed every time its mat is seen again.
 - **Not tested on the real car or ZED yet.** Tested so far: 25 unit tests, the offline simulator, and all nodes run together against a stand-in ROS bus. The code avoids Humble-only APIs, but it hasn't been run on Foxy.

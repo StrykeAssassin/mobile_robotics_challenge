@@ -12,9 +12,12 @@
     start_heading: "edge"       # car squared to the arena edge with the jig; or "diagonal", or degrees
     start_inset: 1.5            # car at the centre of the 3 x 3 m start zone
     # ---- topics / frames ----
-    odom_frame: "odom"
+    odom_frame: "odom"          # known-map mode: car.launch.py switches these to sar_map, /sar/odom
     odom_topic: "/zed/zed_node/odom"
     scan_topic: "/sar/scan"
+    # ---- known-map mode (set on the launch line: prior_map:=... course_file:=...) ----
+    prior_map: ""               # saved course map .yaml (ZED save_map, ply_to_map or compare_maps --merged)
+    course_file: ""             # course_measurements.yaml: measured start marks and exits
 
 depth_scan:
   ros__parameters:
@@ -55,8 +58,31 @@ local_driver:
     fence_margin: 0.6
     watchdog: 0.5
 
+localizer:
+  ros__parameters:
+    raw_odom_topic: "/zed/zed_node/odom"
+    raw_odom_frame: "odom"
+    map_frame: "sar_map"
+    scan_frame: "zed_left_camera_frame"
+    n_particles: 300
+    sigma_hit: 0.12             # m: how close a scan point must be to a mapped obstacle to count
+    z_hit: 0.75                 # the rest is 'unexplained' (cards, moved pieces): rebuilt course
+    max_step: 0.04              # m of correction per update (never looks like a jump)
+    min_explained: 0.35         # hold the correction if less of the scan matches the map
+
+map_diff:
+  ros__parameters:
+    tol: 0.45                   # m from anything mapped before something counts as new (rebuilt course)
+    min_length: 0.1             # card-sized blobs only
+    max_length: 0.75
+    max_width: 0.35
+    min_hits: 3                 # seen in 3 updates (1 s apart) before it's reported
+
 mission_manager:
   ros__parameters:
+    exit_rule: "stars"          # "stars": nearest exit matching a star on a SAFE card; "sign": old rule
+    route_clearance: 0.8        # known-map mode: route points kept this far from mapped obstacles
+    max_gap_viewpoints: 6
     n_lanes: 3                  # 4 only if turn_radius <= 1.25 m
     ring_inset: 3.0
     gate_layout: "corners"      # TA question: "corners" (3 x 3 m zones) or "midpoints" (one mat per side)
@@ -89,6 +115,11 @@ exit_detector:
 board_detector:
   ros__parameters:
     rgb_topic: "/zed/zed_node/rgb/image_rect_color"
+    use_matcher: true           # reference-photo matching (core/card_matcher.py)
+    card_refs: ""               # "" = the package's cards/ folder; or your own folder of card photos
+    match_min_px: 90            # card box height before matching is tried (reliable from ~140 px)
+    matcher_full_frame: true    # no YOLO model yet: the matcher searches whole frames
+    matcher_rate: 2.0
     model_path: "~/sar_models/detector.onnx"
     classifier_path: "~/sar_models/classifier.onnx"
     class_names: ["card", "star", "cone", "box"]
