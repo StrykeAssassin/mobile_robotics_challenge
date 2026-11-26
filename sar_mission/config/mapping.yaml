@@ -1,0 +1,57 @@
+# Auto-mapping run on the REAL car (Jetson, Foxy, ZED2) with RTAB-Map recording the map.
+# Start the run with the car on a taped start mark (start_corner), squared to the arena edge:
+# then the map's origin is that start pose and arena coordinates line up with it.
+
+/**:
+  ros__parameters:
+    arena_size: 20.0
+    search_min: 5.0
+    search_max: 15.0
+    start_corner: "SW"
+    start_heading: "edge"
+    start_inset: 1.5
+    odom_frame: "odom"
+    odom_topic: "/zed/zed_node/odom"
+    scan_topic: "/sar/scan"
+
+depth_scan:
+  ros__parameters:
+    depth_topic: "/zed/zed_node/depth/depth_registered"
+    camera_info_topic: "/zed/zed_node/depth/camera_info"
+    scan_frame: "zed_left_camera_frame"
+    camera_height: 0.25         # MEASURE: lens centre above the floor
+    max_rate: 10.0
+
+auto_mapper:
+  ros__parameters:
+    cmd_topic: "/cmd_vel"
+    phases: ["ring", "ring", "lanes_x", "lanes_y", "ring_rev", "frontiers"]
+    ring_inset: 2.5             # loop through the middle of the buffer corridor
+    n_lanes: 0                  # 0 = auto: 3 lanes if the U-turn fits (turn radius <= ~1.5 m), else 2
+    # --- slowness: "slow" is already the car's lowest throttle, so we stop often instead ---
+    slow_linear: 0.3            # 0.1 < x <= 0.6 = slow (W3 manual)
+    pause_every: 1.5            # m between stop-and-look pauses (smaller = slower, more detail)
+    pause_time: 1.5             # s stopped each time
+    steer_change_pause: 0.8     # s stopped before every steering change (turns start from standstill)
+    duty_on: 1.0                # throttle pulsing: 1.0 = off. Try 0.7 only if the car runs smoothly
+    duty_turn: 1.0
+    duty_period: 3.0
+    # --- car (it's wonky: these margins cover it) ---
+    steering_mode: "three_value"
+    turn_radius: 1.65           # MEASURE: average of left and right
+    turn_radius_left: 0.0       # MEASURE if left and right lock differ a lot (0 = use turn_radius)
+    turn_radius_right: 0.0
+    radius_spread: 0.25         # turns are planned to be safe even if 25% tighter or wider
+    steer_hold: 0.5             # s: minimum time between steering changes
+    wp_tolerance: 1.0
+    reverse_allowed: false      # MEASURE
+    lock_angular: 0.15
+    clearance: 0.4              # a bit wider than in the mission: no rush while mapping
+    inflation: 0.45
+    fence_margin: 0.8
+    # --- stopping ---
+    coverage_goal: 0.97
+    max_time: 2700.0            # s (45 min); stop earlier any time with /sar/mapper_enable false
+    jump_threshold: 0.3         # odometry jump (m) that means tracking was lost
+    jump_pause: 4.0
+    start_enabled: true

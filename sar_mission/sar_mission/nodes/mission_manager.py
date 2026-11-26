@@ -1,0 +1,135 @@
+"""mission_manager: the state machine (LANES -> RING -> MOPUP -> EXIT -> DONE, with INSPECT detours).
+
+Subscribes: odom, /sar/targets (tracker JSON), /sar/exit (exit_detector JSON), /sar/mats (JSON),
+            /sar/grid (OccupancyGrid, to avoid cluttered viewpoints), /sar/go (Bool, optional start)
+Publishes:  /sar/route (Path, odom frame), /sar/state (String), /sar/inspect_feedback (String JSON)
+On DONE it prints the target report and the exit used.
+"""
+
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from rclpy.node import Node
+from std_msgs.msg import Bool, String
+
+from ..core import waypoints as W
+from ..core.mission import DONE, MissionLogic, MissionParams
+from . import ros_utils as U
+
+
+class MissionManager(Node):
+    def __init__(self):
+        super().__init__('mission_manager')
+        self.odom_frame = U.param(self, 'odom_frame', 'odom')
+        self.arena = U.arena_from_params(self)
+        n_lanes = int(U.param(self, 'n_lanes', 3))
+        lanes = W.lanes(self.arena, self.arena.start, n_lanes=n_lanes,
+                        overrun=float(U.param(self, 'lane_overrun', 1.0)),
+                        axis=U.param(self, 'lane_axis', 'auto'))
+        inset = float(U.param(self, 'ring_inset', 3.0))
+        pull = float(U.param(self, 'ring_mid_pull', 0.0))
+        ring = lambda xy, hd: W.ring(self.arena, xy, hd, inset=inset, mid_pull=pull)
+        colours = list(U.param(self, 'gate_colours', ['red', 'blue', 'green', 'yellow']))
+        gates = W.default_gates(self.arena, U.param(self, 'gate_layout', 'corners'), colours=tuple(colours))
+        names = ['lanes_end', 'ring_end', 'forced_exit', 'estop', 'inspect_max_dist', 'inspect_cap',
+                 'inspect_budget', 'inspect_dwell', 'view_distance', 'pre_distance', 'gate_tolerance',
+                 'gate_half_size', 'min_targets_for_shortcut', 'jump_threshold', 'wp_block_time']
+        defaults = MissionParams()
+        kw = dict((n, type(getattr(defaults, n))(U.param(self, n, getattr(defaults, n)))) for n in names)
+        kw['start_on'] = U.param(self, 'start_on', 'motion')
+        self.grid = None
+        self.logic = MissionLogic(MissionParams(**kw), self.arena, lanes, ring, gates, clear_fn=self._clear)
+        self.pose = None
+        self.targets = []
+        self.candidates = []
+        self.exit_info = None
+        self.mats = {}
+        self.go = kw['start_on'] != 'topic'
+        self.reported = False
+        self.n_events = 0
+        self.create_subscription(Odometry, U.param(self, 'odom_topic', '/zed/zed_node/odom'), self.on_odom,
+                                 U.SENSOR_QOS)
+        self.create_subscription(String, '/sar/targets', self.on_targets, U.RELIABLE_QOS)
+        self.create_subscription(String, '/sar/exit', self.on_exit, U.RELIABLE_QOS)
+        self.create_subscription(String, '/sar/mats', self.on_mats, U.RELIABLE_QOS)
+        self.create_subscription(OccupancyGrid, '/sar/grid', self.on_grid, U.RELIABLE_QOS)
+        self.create_subscription(Bool, '/sar/go', self.on_go, U.RELIABLE_QOS)
+        self.route_pub = self.create_publisher(Path, '/sar/route', U.RELIABLE_QOS)
+        self.state_pub = self.create_publisher(String, '/sar/state', U.RELIABLE_QOS)
+        self.fb_pub = self.create_publisher(String, '/sar/inspect_feedback', U.RELIABLE_QOS)
+        self.create_timer(0.2, self.tick)
+        self.get_logger().info('mission_manager ready: start %s, %d lanes (%.0f m), gates %s'
+                               % (self.arena.start, n_lanes, W.route_length(lanes), gates))
+
+    # ---- inputs ------------------------------------------------------------------------------
+    def on_odom(self, msg):
+        self.pose, _ = U.pose_from_odom(msg)
+
+    def on_targets(self, msg):
+        d = U.json_from(msg)
+        if d:
+            self.targets = d.get('targets', [])
+            self.candidates = d.get('candidates', [])
+
+    def on_exit(self, msg):
+        self.exit_info = U.json_from(msg)
+
+    def on_mats(self, msg):
+        d = U.json_from(msg) or {}
+        self.mats = dict((c, (v[0], v[1])) for c, v in d.items())
+
+    def on_grid(self, msg):
+        self.grid = U.GridView(msg)
+
+    def on_go(self, msg):
+        self.go = bool(msg.data)
+
+    def _clear(self, x, y, r, ignore):
+        return True if self.grid is None else self.grid.clear(x, y, r, ignore, 0.45)
+
+    # ---- loop ----------------------------------------------------------------------------------
+    def tick(self):
+        if self.pose is None or not self.go:
+            return
+        now = U.now_sec(self)
+        route = self.logic.update(now, self.pose, self.candidates, self.targets, self.exit_info, self.mats)
+        self.route_pub.publish(U.path_msg(route, self.odom_frame, self.get_clock().now().to_msg()))
+        st = String()
+        st.data = '%s t=%.0f' % (self.logic.state, self.logic.elapsed(now))
+        self.state_pub.publish(st)
+        for fb in self.logic.pop_feedback():
+            self.fb_pub.publish(U.json_msg(fb))
+        for e in self.logic.events[self.n_events:]:
+            self.get_logger().info(e)
+        self.n_events = len(self.logic.events)
+        if self.logic.state == DONE and not self.reported:
+            self.report()
+            self.reported = True
+
+    def report(self):
+        lines = ['', '=========== SEARCH AND RESCUE REPORT ===========',
+                 'time %.0f s, exit gate: %s' % (self.logic.elapsed(U.now_sec(self)), self.logic.exit_colour),
+                 '%-4s %-8s %-6s %-14s %s' % ('id', 'class', 'conf', 'arena x, y (m)', 'confirmed')]
+        unconfirmed = 0
+        for r in sorted(self.targets, key=lambda r: r.get('id', 0)):
+            if not r.get('confirmed'):
+                unconfirmed += 1
+                continue
+            if r.get('class') == 'NOT_TARGET':
+                continue
+            lines.append('%-4s %-8s %-6.2f %5.1f, %-8.1f %s' % (r['id'], r['class'], r['confidence'],
+                                                                r['x'], r['y'], 'yes' if r['confirmed'] else 'no'))
+        counts = {}
+        for r in self.targets:
+            if r.get('confirmed') and r.get('class') != 'NOT_TARGET':
+                counts[r['class']] = counts.get(r['class'], 0) + 1
+        lines.append('confirmed: %s' % (', '.join('%s %d' % kv for kv in sorted(counts.items())) or 'none'))
+        lines.append('plus %d unconfirmed sightings (in the CSV, confirmed = False)' % unconfirmed)
+        lines.append('================================================')
+        self.get_logger().info('\n'.join(lines))
+
+
+def main(args=None):
+    U.spin(MissionManager, args)
+
+
+if __name__ == '__main__':
+    main()

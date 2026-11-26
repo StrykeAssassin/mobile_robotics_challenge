@@ -1,0 +1,98 @@
+# Parameters for the REAL car (Jetson, ROS 2 Foxy, ZED2).
+# Every number marked MEASURE comes from the day-1 tests (Phase 1 PDF, assumptions A8-A11);
+# change it here, not in the code.
+
+/**:
+  ros__parameters:
+    # ---- arena (arena frame: origin SW corner, x east, y north) ----
+    arena_size: 20.0
+    search_min: 5.0
+    search_max: 15.0
+    start_corner: "SW"          # SW / SE / NE / NW: set per run (start_corner:=... on the launch line)
+    start_heading: "edge"       # car squared to the arena edge with the jig; or "diagonal", or degrees
+    start_inset: 1.5            # car at the centre of the 3 x 3 m start zone
+    # ---- topics / frames ----
+    odom_frame: "odom"
+    odom_topic: "/zed/zed_node/odom"
+    scan_topic: "/sar/scan"
+
+depth_scan:
+  ros__parameters:
+    depth_topic: "/zed/zed_node/depth/depth_registered"
+    camera_info_topic: "/zed/zed_node/depth/camera_info"
+    scan_frame: "zed_left_camera_frame"
+    camera_height: 0.25         # MEASURE: lens centre above the floor
+    pixel_step: 4
+    min_height: 0.03            # obstacle threshold above the fitted floor, + 1 cm per metre
+    min_height_per_m: 0.01
+    max_height: 0.8
+    unknown_fraction: 0.4       # >40% missing depth close in front -> treat as blocked
+    unknown_range: 1.2
+    max_rate: 10.0
+
+path_planner:
+  ros__parameters:
+    inflation: 0.4              # car half-width + margin
+    replan_period: 1.0
+    sensor_offset: 0.2          # fallback if TF odom -> scan frame is missing
+
+local_driver:
+  ros__parameters:
+    cmd_topic: "/cmd_vel"
+    steering_mode: "three_value"   # MEASURE: "proportional" if the servo turns in proportion to angular.z
+    turn_radius: 1.65              # MEASURE: full-lock turn radius at slow speed
+    turn_radius_left: 0.0          # MEASURE if left/right differ (0 = use turn_radius)
+    turn_radius_right: 0.0
+    radius_spread: 0.25            # wonky car: arcs must be clear for radii 25% tighter or wider
+    steer_hold: 0.5                # s between steering changes
+    reverse_allowed: false         # MEASURE: set true if a negative linear.x reverses the car
+    slow_linear: 0.3               # 0.1 < x <= 0.6 = slow (W3 manual)
+    lock_angular: 0.15             # inside the manual's left/right bands (+-0.2 is NOT left)
+    allow_fast: false
+    clearance: 0.36
+    lookahead: 1.2
+    use_fence: true
+    fence_margin: 0.6
+    watchdog: 0.5
+
+mission_manager:
+  ros__parameters:
+    n_lanes: 3                  # 4 only if turn_radius <= 1.25 m
+    ring_inset: 3.0
+    gate_layout: "corners"      # TA question: "corners" (3 x 3 m zones) or "midpoints" (one mat per side)
+    gate_colours: ["red", "blue", "green", "yellow"]   # in order SW, SE, NE, NW (or S, E, N, W)
+    start_on: "motion"          # clock starts when the car first moves (after pressing O on the remote)
+    lanes_end: 600.0
+    ring_end: 900.0
+    forced_exit: 1020.0
+    estop: 1170.0
+
+target_tracker:
+  ros__parameters:
+    use_depth: true
+    depth_topic: "/zed/zed_node/depth/depth_registered"
+    camera_info_topic: "/zed/zed_node/depth/camera_info"
+    use_zed_objects: false      # true = ZED person detection as a backup position source
+    csv_path: "~/sar_targets.csv"
+    accept_conf: 0.7
+    min_class_obs: 3
+
+exit_detector:
+  ros__parameters:
+    use_camera: true
+    rgb_topic: "/zed/zed_node/rgb/image_rect_color"
+    sign_from_blobs: true       # until YOLO knows the exit sign
+    s_min: 115                  # calibrate on site (lock ZED white balance + exposure first)
+    v_min: 60
+    publish_debug: false
+
+board_detector:
+  ros__parameters:
+    rgb_topic: "/zed/zed_node/rgb/image_rect_color"
+    model_path: "~/sar_models/detector.onnx"
+    classifier_path: "~/sar_models/classifier.onnx"
+    class_names: ["card", "star", "cone", "box"]
+    imgsz: 1280
+    conf_threshold: 0.35
+    classify_min_px: 70
+    max_rate: 8.0
