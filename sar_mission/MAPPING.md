@@ -40,7 +40,7 @@ Do these with the remote and a tape measure. Put the results in `config/mapping.
 |---|---|---|
 | Turn radius | On slow, full lock, drive one full circle **left and one right**. Measure each diameter and halve it. Do each twice; the spread tells you how wonky it is. | `turn_radius` (average), plus `turn_radius_left` / `turn_radius_right` if they differ by more than ~15% |
 | Steering type | `ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{angular: {z: 0.05}}"`, then again with `z: 0.15`. Same wheel angle both times? | same angle → `steering_mode: three_value`, different → `proportional` |
-| Reverse | `ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist "{linear: {x: -0.3}}"` with the wheels off the ground. Does it reverse? | `reverse_allowed` |
+| Reverse | Press O (autonomous) first. `ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist "{linear: {x: -0.3}}"` with the wheels off the ground. Does it reverse? If it only brakes, send 0 for a moment and then -0.3 again: if it reverses then, set `reverse_double_tap: true`. | `reverse_allowed`, `reverse_double_tap` |
 | Slow speed | Time 5 m on slow. | for planning time |
 | Camera height | Floor to the middle of the ZED lens. | `camera_height` |
 

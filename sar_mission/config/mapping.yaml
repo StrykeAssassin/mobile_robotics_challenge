@@ -44,7 +44,9 @@ auto_mapper:
     radius_spread: 0.25         # turns are planned to be safe even if 25% tighter or wider
     steer_hold: 0.5             # s: minimum time between steering changes
     wp_tolerance: 1.0
-    reverse_allowed: false      # MEASURE
+    reverse_allowed: false      # MEASURE: true once the car is seen to reverse (Part C)
+    reverse_linear: -0.3        # reverse speed sent when boxed in (1.5 s at a time)
+    reverse_double_tap: false   # true if the car only reverses after a brake tap (reverse, stop, reverse)
     lock_angular: 0.15
     clearance: 0.4              # a bit wider than in the mission: no rush while mapping
     inflation: 0.45

@@ -69,6 +69,11 @@ class AutoMapper(Node):
         self.logic = MapperLogic(mp, self.arena, self.grid, self.driver, self.planner)
         self.shaper = SteeringShaper(mode, lock_angular=float(U.param(self, 'lock_angular', 0.15)))
         self.slow = float(U.param(self, 'slow_linear', 0.3))
+        # reversing (only when reverse_allowed): many RC speed controllers only reverse after a brake
+        # tap: reverse, neutral, reverse. reverse_double_tap does that each time reversing starts.
+        self.reverse_linear = -abs(float(U.param(self, 'reverse_linear', 0.3)))
+        self.double_tap = bool(U.param(self, 'reverse_double_tap', False))
+        self.rev_started = None
         self.watchdog = float(U.param(self, 'watchdog', 0.5))
         self.jump_threshold = float(U.param(self, 'jump_threshold', 0.3))
         self.jump_pause = float(U.param(self, 'jump_pause', 4.0))
@@ -130,7 +135,20 @@ class AutoMapper(Node):
 
     # ---- loop ----------------------------------------------------------------------------------
     def stop(self):
+        self.rev_started = None
         self.cmd_pub.publish(Twist())
+
+    def throttle(self, level, now):
+        """linear.x for a speed level: 1 slow forward, 0 stop, -1 reverse."""
+        if level >= 0:
+            self.rev_started = None
+            return self.slow if level > 0 else 0.0
+        if self.rev_started is None:
+            self.rev_started = now
+        t = now - self.rev_started
+        if self.double_tap and t < 0.4:
+            return self.reverse_linear if t < 0.2 else 0.0     # brake tap, then neutral
+        return self.reverse_linear
 
     def tick(self):
         now = U.now_sec(self)
@@ -146,7 +164,7 @@ class AutoMapper(Node):
             return self._status('holding after odometry jump')
         u, level, status = self.logic.update(now, self.pose, self.speed, self.scan)
         cmd = Twist()
-        cmd.linear.x = self.slow if level > 0 else 0.0
+        cmd.linear.x = self.throttle(level, now)
         # keep steering during the throttle pulses and pauses: the wheels stay pointed where the car
         # is going, instead of the servo flicking between lock and straight every pulse
         cmd.angular.z = self.shaper.angular(u, now) if status != 'done' else 0.0
