@@ -11,7 +11,7 @@ the truth**:
 | Localizer | Particle filter: depth scan vs map (as in HW4). Pulls ZED drift back. Beams that hit unmapped things (cards, moved pieces) count as "unexplained" instead of dragging the pose. Holds the correction when the scan doesn't match well. | `core/localizer.py`, node `localizer` |
 | Map difference | Anything the camera sees > 0.45 m from every mapped obstacle, card-sized, and seen in 3 updates becomes a target to inspect. Moved boxes don't trigger it. | `core/map_diff.py`, node `map_diff` |
 | Routes | Lanes and ring with every point pushed out of mapped obstacles, plus extra viewpoints where the map says the route can't see. | `core/known_route.py` |
-| Card matcher | ORB + homography against photos of the real cards. Class, and for SAFE cards the star colour read from the image. Works without YOLO. | `core/card_matcher.py`, in `board_detector` |
+| Card recognizer | Template matching against photos of the real cards (ORB double-checks big ones). Class, and for SAFE cards the star colour read from the image. Works without YOLO, from ~4 m; map_diff targets are projected into the image and classified there. See **CARDS.md**. | `core/card_recognizer.py`, in `board_detector` |
 | Exit rule | Nearest exit whose colour matches a star on a SAFE card found. | `core/mission.py`, `core/tracker.py` |
 | Measured course | Start marks and exits from `course_measurements.yaml`. | `core/course.py` |
 
@@ -43,15 +43,15 @@ arena frame using the start corner saved in its `_meta.yaml`).
 
 ## 2. Card photos
 
-`cards/` ships the 12 cards photographed so far (crops of the printed area, upright). Name
+`cards/` ships the 12 cards photographed so far (each cropped to the card board, upright). Name
 files `CLASS[_STARCOLOUR]_anything.png`, e.g. `SAFE_blue_01.png`, `SAFE_none_02.png`,
 `HOSTAGE_cartoon.png`. To use your own folder: `card_refs:=~/cards` (board_detector parameter).
 All SAFE cards share one design, so the star colour is always **read from the camera image**
 (top-right of the card), never taken from the reference.
 
-Matching is reliable when the card is ≥ 140 px tall (≈ 2 m or closer at 720p); the inspection
-stops are at 1.5 m. Without a trained YOLO model the matcher searches whole frames at 2 Hz
-(`matcher_full_frame`).
+The recognizer classifies cards down to ~50-60 px tall (4-5 m at 720p). Without a trained YOLO
+model it searches whole frames at 2 Hz, plus regions from the depth image and the cards map_diff
+reported (projected into the image). Details, test results and which photos to take: **CARDS.md**.
 
 ## 3. Challenge day
 
@@ -114,7 +114,7 @@ stand-in ROS bus with 3x drift: exited through the allowed gate, position error 
 - **Boxed in, no reverse.** A car that can't reverse can still get trapped between cards and
   obstacles during an inspection. The map doesn't fix that; testing reverse on day 1 does.
 - **Cards leaning on obstacles** are within the map tolerance, so map difference can't see them.
-  The camera (matcher / YOLO) finds those.
+  The camera (recognizer / YOLO) finds those.
 - **Map difference doesn't find cards by itself:** it only says "look here". The class comes
   from the camera.
 - **Routes** are the lanes and ring cleaned against the map, plus up to 6 gap viewpoints. They are

@@ -37,7 +37,7 @@ ZED odom ───────────────────────�
 | `target_tracker` | Places each detection in 3D using depth and TF. Fuses sightings: weighted position, log-probability class votes, and a board-facing estimate. Writes `~/sar_targets.csv`. | HW3 least squares, HW4 weighting |
 | `exit_detector` | Exit sign colour vote, plus a map of coloured floor mats (only pixels on the floor count, so cones and the sign are excluded). | — |
 | `mission_manager` | State machine with timers. Prints the final report. | — |
-| `board_detector` | YOLOv8 detector + crop classifier, run with OpenCV DNN. See `tools/TRAINING.md`. | HW4 detection idea |
+| `board_detector` | Card recognizer (templates of the real cards, no training; **CARDS.md**), optional YOLOv8 detector + crop classifier via OpenCV DNN (`tools/TRAINING.md`). | HW4 detection idea |
 | `fake_detector`, `steering_wrapper` | **Simulation only**: stand-in for YOLO, and makes the TurtleBot drive like the car. | — |
 | `dataset_capture` | Saves camera frames for training YOLO. | — |
 | `auto_mapper` | Drives the course slowly for RTAB-Map. Runs corridor laps, criss-cross lanes and a reverse lap, then fills gaps. See **MAPPING.md**. | HW3 auto_explore idea |
@@ -46,7 +46,8 @@ ZED odom ───────────────────────�
 | `map_diff` | Known-map mode: card-sized things that aren't in the saved map become targets to inspect. | — |
 
 Tools: `tools/ply_to_map.py` (iPad point cloud -> map), `tools/compare_maps.py` (iPad vs ZED or day vs
-day, merged map), card reference photos in `cards/` (used by `board_detector`'s card matcher).
+day, merged map), card reference photos in `cards/` (used by `board_detector`'s card recognizer,
+see **CARDS.md**), `tools/card_bench/` (synthetic test of the card recognizer).
 
 All the logic is in `sar_mission/core/` (plain Python + numpy, no ROS). The nodes in `sar_mission/nodes/` are thin wrappers, so the same code runs in the unit tests, the offline simulator, Gazebo and on the car.
 

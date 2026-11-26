@@ -115,11 +115,22 @@ exit_detector:
 board_detector:
   ros__parameters:
     rgb_topic: "/zed/zed_node/rgb/image_rect_color"
-    use_matcher: true           # reference-photo matching (core/card_matcher.py)
+    use_matcher: true           # reference-photo matching
+    use_recognizer: true        # core/card_recognizer.py (templates, works to ~50 px); false = ORB only
     card_refs: ""               # "" = the package's cards/ folder; or your own folder of card photos
-    match_min_px: 90            # card box height before matching is tried (reliable from ~140 px)
-    matcher_full_frame: true    # no YOLO model yet: the matcher searches whole frames
+    match_min_px: 40            # card box height before matching is tried
+    min_score: 0.60             # template fit needed to accept a card (raise if you see wrong classes)
+    matcher_full_frame: true    # no YOLO model yet: the recognizer searches whole frames
     matcher_rate: 2.0
+    look_at_targets: true       # also classify known-but-unconfirmed cards projected into the image
+    look_rate: 2.0
+    look_max: 2                 # regions searched per frame and per source (each ~0.1-0.3 s on the Jetson CPU)
+    depth_proposals: true       # search where the depth image shows something standing on the floor
+    depth_topic: "/zed/zed_node/depth/depth_registered"
+    depth_info_topic: "/zed/zed_node/depth/camera_info"
+    card_height: 0.42           # MEASURE: card board height (m)
+    camera_height: 0.25         # MEASURE: lens centre above the floor (same as depth_scan)
+    rgb_info_topic: "/zed/zed_node/rgb/camera_info"
     model_path: "~/sar_models/detector.onnx"
     classifier_path: "~/sar_models/classifier.onnx"
     class_names: ["card", "star", "cone", "box"]

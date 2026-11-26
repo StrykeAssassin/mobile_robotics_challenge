@@ -13,8 +13,11 @@ Crop each photo to the card's printed area, upright. tools/TRAINING.md / KNOWN_M
 
 Star colour (decides which exits may be used): all SAFE cards share one design and differ only in
 the star (blue / green / red / yellow / none), so the star colour is always read from the CAMERA
-image, inside the area where the matched reference has its star (top right of the card). The
+image, in the top-right box of the card (same reader as card_recognizer.star_from_card). The
 reference's own star colour is never trusted on its own. 'none' = a SAFE card without a star.
+
+card_recognizer.py (template matching) is now the main recognizer; this ORB matcher double-checks
+big cards and finds them when no white outline is visible.
 
 OpenCV only (cv2 is on the Jetson); no training needed.
 """
@@ -149,21 +152,18 @@ class CardMatcher(object):
         return quad
 
     def _star_colour(self, query, H, ref):
-        """Star colour read from the camera image inside the reference's star area.
-        Returns 'red' / 'blue' / 'green' / 'yellow', or 'none' if that area has no gate colour."""
-        from .colour import dominant_colour
+        """Star colour read from the camera image: the card is warped upright and the shared star
+        reader (card_recognizer.star_from_card) looks at its top-right box.
+        Returns 'red' / 'blue' / 'green' / 'yellow', or 'none'."""
+        from .card_recognizer import star_from_card
         cv2 = self.cv2
         w, h = self.ref_size
         try:
             warped = cv2.warpPerspective(query, np.linalg.inv(H), (w, h))
         except np.linalg.LinAlgError:
             return ref['star'] or 'none'
-        hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)[ref['star_mask']]
-        if hsv.size == 0:
-            return ref['star'] or 'none'
-        c, frac = dominant_colour(hsv.reshape(-1, 1, 3), colours=STAR_COLOURS, min_fraction=0.04,
-                                  s_min=self.s_min, v_min=self.v_min)
-        return c if c is not None else 'none'
+        colour, _ = star_from_card(cv2, cv2.resize(warped, (120, 160), interpolation=cv2.INTER_AREA))
+        return colour
 
     def _confidence(self, best, second):
         if best < self.min_inliers:

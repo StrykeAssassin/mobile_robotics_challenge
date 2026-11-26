@@ -97,3 +97,65 @@ def decode(text):
         return json.loads(text)
     except (ValueError, TypeError):
         return None
+
+
+# ---- depth proposals: "something standing on the floor here" --------------------------------------
+
+def standing_objects(depth, fx, fy, cx, cy, plane, step=2, h_min=0.06, h_top_min=0.15, h_max=0.9,
+                     r_min=0.5, r_max=5.5, max_width=1.6, min_cells=6):
+    """Blobs of depth points that stand up from the floor (cards, boxes, cones, legs...).
+
+    depth: metres (NaN/0 = none), any resolution with matching intrinsics. plane: (n, d) of the floor
+    in the same optical frame with n pointing up (as published on /sar/floor), so a point's height
+    is n.p + d. Returns a list of dicts sorted nearest first:
+      {'bbox': [u1, v1, u2, v2] (depth pixels), 'z': median depth, 'top': highest point (m),
+       'width': blob width (m)}
+    Cheap (subsampled grid + connected components), so it can run on every frame.
+    """
+    import cv2
+    n = np.asarray(plane[0], np.float32)
+    d0 = float(plane[1])
+    dd = depth[::step, ::step].astype(np.float32)
+    vv, uu = np.mgrid[0:depth.shape[0]:step, 0:depth.shape[1]:step].astype(np.float32)
+    ok = np.isfinite(dd) & (dd > r_min) & (dd < r_max)
+    z = np.where(ok, dd, 0.0)
+    x = (uu - cx) * z / fx
+    y = (vv - cy) * z / fy
+    h = n[0] * x + n[1] * y + n[2] * z + d0
+    up = ok & (h > h_min + 0.01 * z) & (h < h_max)          # noise grows with range
+    mask = cv2.morphologyEx(up.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    k, lab, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    out = []
+    for i in range(1, k):
+        if stats[i, cv2.CC_STAT_AREA] < min_cells:
+            continue
+        sel = (lab == i) & up
+        if np.count_nonzero(sel) < min_cells:
+            continue
+        zs = z[sel]
+        zm = float(np.median(zs))
+        top = float(np.percentile(h[sel], 95))
+        x0, y0, w, hh = stats[i, :4]
+        width = w * step * zm / fx
+        if top < h_top_min or width > max_width:
+            continue
+        out.append({'bbox': [float(x0 * step), float(y0 * step), float((x0 + w) * step), float((y0 + hh) * step)],
+                    'z': zm, 'top': top, 'width': float(width)})
+    out.sort(key=lambda o: o['z'])
+    return out
+
+
+def card_regions(objects, fx, fy, card_h=0.42, scale=(1.0, 1.0), pad=0.35):
+    """Image regions to search for a card in, one per standing object: the object's box widened to
+    at least a card's size at that distance. scale converts depth pixels to image pixels.
+    Returns [(box [x1, y1, x2, y2] in image pixels, expected card height px)]."""
+    sx, sy = scale
+    out = []
+    for o in objects:
+        u1, v1, u2, v2 = o['bbox']
+        hp = fy * card_h / max(o['z'], 0.1) * sy
+        cxp, bot = (u1 + u2) / 2.0 * sx, v2 * sy
+        half_w = max((u2 - u1) * sx / 2.0, 0.4 * hp) + pad * hp
+        top = min(v1 * sy, bot - hp) - pad * hp
+        out.append(([cxp - half_w, top, cxp + half_w, bot + pad * hp], hp))
+    return out
