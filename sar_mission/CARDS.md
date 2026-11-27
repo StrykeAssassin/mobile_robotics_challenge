@@ -9,6 +9,7 @@ needed: it compares what the camera sees with photos of the real cards in `cards
 | Step | What | Where |
 |---|---|---|
 | Find | Whole frame: white card outlines (several brightness levels, local contrast, edges). | `CardRecognizer.find_quads` |
+| Find (no outline) | If the outline search finds nothing, the most card-like patch of printed ink (coloured or dark, on a pale surround) is searched as a region, e.g. a white card leaning on a white wall. Needs a clearer fit (score 0.70). | `CardRecognizer.colour_regions` |
 | Find (far) | Regions where a card should be: things standing on the floor in the depth image (`/sar/floor` plane from `depth_scan`), and cards the tracker already knows about projected into the image (`/sar/targets` candidates, e.g. from `map_diff`). | `board_detector` (`depth_proposals`, `look_at_targets`) |
 | Find (YOLO) | Detector boxes, once a model is trained (`tools/TRAINING.md`). | `board_detector` |
 | Classify | Straighten the card to 48x64 px and correlate it with every reference (colour + fine detail), after nudging the corners to fit. Below `min_score` (0.60) it's not a card. | `CardRecognizer.classify_region` |
@@ -51,6 +52,23 @@ agreeing frames, and the mission comes back to inspect unconfirmed cards from cl
 **Caveat:** these are synthetic frames made from your 12 phone photos. The real ZED image will
 differ (exposure, colour, motion blur, how the cards are mounted), so treat the numbers as a
 comparison between methods, not a promise. The next step is a recorded ZED test (below).
+
+## Real ZED test (27 Nov)
+
+Two ZED recordings from the car's height, one frame per second (left camera), each card approached
+from far away, passed at an angle, moved by hand and seen up close, mostly against a white wall:
+
+| Recording | Card found | Wrong class | Star colour (SAFE) |
+|---|---|---|---|
+| THREAT card (`hostage1`), 152 frames | 119 → **133** | 0 | — |
+| SAFE green star, 136 frames | 95 → **101** | 0 | wrong 2 → **0**; not read 26 → 21 |
+
+Left: before the real-data fixes; right: after. Remaining misses are mostly the card far away
+(~45 px), cut off by the frame edge, edge-on, lying flat or hidden behind a hand or a leg.
+Fixes made from these frames: the ink-patch search above; the star is read from a slightly enlarged
+outline (on the real cards the star sits right on the corner); green's hue was moved to where the
+ZED shows it (paler and more blue-green than the phone photos); the figure's arm can no longer be
+read as a red star. Synthetic bench after the change: whole frame 57% → 66%, 0 false alarms.
 
 ## Reference photos (`cards/`)
 

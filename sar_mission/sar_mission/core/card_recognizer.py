@@ -99,7 +99,7 @@ class CardRecognizer(object):
     def __init__(self, ref_dir=None, refs=None, min_px=40, min_score=0.60, temperature=9.0,
                  verify_px=120, use_features=True, levels=(140, 170, 200, 225), s_max=80,
                  blank_fraction=0.05, s_min=90, v_min=70, box_min_score=0.7,
-                 work_height=720, hp_weight=4.5):
+                 work_height=720, hp_weight=4.5, region_min_score=0.70, colour_max=1):
         import cv2
         self.cv2 = cv2
         self.min_px = min_px
@@ -107,6 +107,8 @@ class CardRecognizer(object):
         self.box_min_score = box_min_score
         self.work_height = work_height
         self.hp_weight = hp_weight
+        self.region_min_score = region_min_score
+        self.colour_max = colour_max
         self.temperature = temperature
         self.verify_px = verify_px
         self.levels = levels
@@ -215,9 +217,11 @@ class CardRecognizer(object):
 
     def star_colour(self, img, quad):
         """Star colour from the top-right box of the straightened card: 'red' / 'blue' / 'green' /
-        'yellow', or 'none'. The card is first white-balanced on its own paper, so lighting colour
-        doesn't matter; then the hue angle of the coloured pixels in the box picks the colour."""
-        colour, _ = star_from_card(self.cv2, self._warp(img, quad, 120, 160, 0))
+        'yellow', or 'none'. The outline is enlarged by 6% first: the star sits right on the corner,
+        and a slightly tight outline would cut it off."""
+        q = order_corners(quad)
+        c = q.mean(axis=0)
+        colour, _ = star_from_card(self.cv2, self._warp(img, c + (q - c) * 1.06, 120, 160, 0))
         return colour
 
     # ---- 1. candidate quads ----------------------------------------------------------------
@@ -433,13 +437,72 @@ class CardRecognizer(object):
                 out.append(r)
         return out, backs
 
-    def find_all(self, img, max_cards=6, include_backs=False):
+    def colour_regions(self, img, max_regions=3, s_min=70, min_h=14):
+        """Regions that may hold a card whose white edge can't be seen (e.g. a white card leaning on a
+        white wall): blobs of coloured ink (the printed figure, the star) on a pale, unsaturated
+        surround. Returns [(box, expected card height px)], biggest first, for classify_region."""
+        cv2 = self.cv2
+        f = 1.0
+        work = img
+        if img.shape[0] > 400:
+            f = 360.0 / img.shape[0]
+            work = cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
+        S, V = hsv[..., 1], hsv[..., 2]
+        vbright = float(np.percentile(V, 95))
+        # printed ink: coloured, or dark against the paper (trousers, hair, outlines)
+        ink = (((S > s_min) & (V > 40)) | (V < 0.45 * vbright)).astype(np.uint8) * 255
+        # long horizontal dark bands (skirting boards, desk edges, the floor line) are not cards
+        bands = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((1, 41), np.uint8))
+        ink[bands > 0] = 0
+        # join a figure's pieces (head, body, legs) into one blob: close more vertically
+        ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, np.ones((13, 7), np.uint8))
+        k, lab, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+        H, W = V.shape
+        cands = []
+        for i in range(1, k):
+            x, y, w, h, area = stats[i]
+            if h < min_h * f * 2 or area < 30 or h > 0.6 * H:
+                continue                    # too small, or a close-up (the outline search handles those)
+            if not (0.8 <= h / float(max(w, 1)) <= 6.0):
+                continue
+            # the surround must look like paper: bright and unsaturated, on most of the ring
+            m = max(3, int(0.15 * h))
+            x0, y0, x1, y1 = max(0, x - m), max(0, y - m), min(W, x + w + m), min(H, y + h + m)
+            ring = np.ones((y1 - y0, x1 - x0), bool)
+            ring[y - y0:y - y0 + h, x - x0:x - x0 + w] = False
+            vv, ss = V[y0:y1, x0:x1][ring], S[y0:y1, x0:x1][ring]
+            paper = float(((vv > 0.7 * vbright) & (ss < 60)).mean()) if vv.size else 0.0
+            if paper < 0.45:
+                continue
+            cands.append((paper * np.sqrt(area), x, y, w, h))
+        out = []
+        for _, x, y, w, h in sorted(cands, reverse=True):
+            card_h = h / f / 0.8                          # the figure fills ~80% of the card's height
+            cx, cy = (x + w / 2.0) / f, (y + h / 2.0) / f
+            half_w = max(w / f, 0.75 * card_h) * 0.9
+            box = [max(0.0, cx - half_w), max(0.0, cy - 0.85 * card_h),
+                   min(img.shape[1] - 1.0, cx + half_w), min(img.shape[0] - 1.0, cy + 0.85 * card_h)]
+            if all(_iou(box, o[0]) < 0.4 for o in out):
+                out.append((box, card_h))
+            if len(out) >= max_regions:
+                break
+        return out
+
+    def find_all(self, img, max_cards=6, include_backs=False, colour_regions=True):
         keep, backs = self._best(img, self.find_quads(img))
         out = []
         for r in keep[:max_cards]:
             res = self._finish(img, *r)
             if res is not None:
                 out.append(res)
+        if colour_regions and not out:
+            # nothing found by outline: try the most card-like patch of printed ink (one region,
+            # ~0.1-0.3 s), e.g. a white card leaning on a white wall
+            extra = self.find_in_regions(img, self.colour_regions(img), out, max_regions=self.colour_max)
+            # a guess from ink alone needs a clearer fit than an outline does
+            out += [r for r in extra if r.score >= self.region_min_score
+                    and all(_iou(r.bbox(), o.bbox()) < 0.3 for o in out)]
         if include_backs:
             for q in backs:
                 if all(_iou(_bb(q), r.bbox()) < 0.3 for r in out):
@@ -581,19 +644,21 @@ def _card_shaped(q):
     return wid > 2 and 1.1 <= hgt / wid <= 4.5
 
 
-# Star hue angles in the Lab a-b plane (degrees), measured on the photographed SAFE cards after
-# white-balancing on the paper. Skin (the raised fist) sits at ~40 deg like red but is kept out by
-# the box, which starts right of the fist.
-STAR_ANGLES = {'red': 38.0, 'yellow': 99.0, 'green': 140.0, 'blue': -81.0}
-STAR_BOX = (0.0, 0.33, 0.55, 1.0)          # y0, y1, x0, x1 as fractions of the card
+# Star hue angles in the Lab a-b plane (degrees), after white-balancing on the paper. Green is set
+# between the phone photos (140) and real ZED frames (160-173), where colours come out paler.
+# Skin (the raised fist) also sits near red; it is kept out because its blob reaches the left side of
+# the star box (the arm comes in from the figure), while the star sits in the corner.
+STAR_ANGLES = {'red': 38.0, 'yellow': 99.0, 'green': 152.0, 'blue': -81.0}
+STAR_BOX = (0.0, 0.36, 0.55, 1.0)          # y0, y1, x0, x1 as fractions of the card
 
 
-def star_from_card(cv2, card, min_fraction=0.035, min_chroma=20.0, max_angle=32.0, max_edge=0.5):
-    """card: straightened BGR card (any size, upright). Returns (colour or 'none', info dict).
+def star_from_card(cv2, card, min_fraction=0.015, min_chroma=18.0, max_angle=32.0):
+    """card: straightened BGR card (any size, upright; best warped from a slightly enlarged outline, so
+    a star on the very corner is inside). Returns (colour or 'none', info dict).
 
     The star box is mostly paper, so it is white-balanced on its own median colour (lighting colour
-    and shading don't matter). The star is the biggest blob of clearly coloured pixels; a blob that
-    mostly hugs the box edge is background showing past a slightly-off card outline, not a star."""
+    and shading don't matter). The star is the biggest blob of coloured pixels that doesn't reach the
+    left side of the box (that would be the figure's arm)."""
     h, w = card.shape[:2]
     y0, y1, x0, x1 = STAR_BOX
     box = card[int(y0 * h):int(y1 * h), int(x0 * w):int(x1 * w)].astype(np.float32)
@@ -605,25 +670,26 @@ def star_from_card(cv2, card, min_fraction=0.035, min_chroma=20.0, max_angle=32.
     sel = (ch > min_chroma).astype(np.uint8)
     info = {'fraction': 0.0}
     k, lab_cc, stats, _ = cv2.connectedComponentsWithStats(sel, connectivity=8)
-    if k <= 1:
+    best = None
+    for i in range(1, k):
+        if stats[i, cv2.CC_STAT_LEFT] == 0:
+            continue                                   # comes in from the left: the arm, not the star
+        if best is None or stats[i, cv2.CC_STAT_AREA] > stats[best, cv2.CC_STAT_AREA]:
+            best = i
+    if best is None:
         return 'none', info
-    i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    blob = lab_cc == i
-    frac = float(stats[i, cv2.CC_STAT_AREA]) / blob.size
-    edge = np.zeros_like(blob)
-    m = max(1, int(round(0.05 * min(blob.shape))))
-    edge[:m, :] = edge[-m:, :] = edge[:, -m:] = True          # top / bottom / right edge of the card
-    on_edge = float(np.count_nonzero(blob & edge)) / max(np.count_nonzero(blob), 1)
-    info.update(fraction=frac, edge=on_edge)
-    if frac < min_fraction or on_edge > max_edge:
+    blob = lab_cc == best
+    frac = float(stats[best, cv2.CC_STAT_AREA]) / blob.size
+    info['fraction'] = frac
+    if frac < min_fraction:
         return 'none', info
     ang = float(np.degrees(np.arctan2((b[blob] * ch[blob]).sum(), (a[blob] * ch[blob]).sum())))
     diffs = dict((c, abs((ang - v + 180.0) % 360.0 - 180.0)) for c, v in STAR_ANGLES.items())
-    best = min(diffs, key=diffs.get)
+    colour = min(diffs, key=diffs.get)
     info.update(angle=ang, chroma=float(ch[blob].mean()))
-    if diffs[best] > max_angle:
+    if diffs[colour] > max_angle:
         return 'none', info
-    return best, info
+    return colour, info
 
 
 def _iou(a, b):
