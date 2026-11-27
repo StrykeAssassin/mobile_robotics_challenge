@@ -15,9 +15,11 @@ import math
 import numpy as np
 
 from . import waypoints as W
+from .geometry import arena_dims
 
 
 def push_clear(prior, pt, clearance, arena_size, max_move=1.5, step=0.15, margin=0.8):
+    sx, sy = arena_dims(arena_size)
     """Nearest point to pt with at least `clearance` to mapped obstacles, or None."""
     x0, y0 = pt
     if prior.clearance(x0, y0) >= clearance:
@@ -28,7 +30,7 @@ def push_clear(prior, pt, clearance, arena_size, max_move=1.5, step=0.15, margin
         n = max(8, int(2 * math.pi * r / step))
         a = np.arange(n) * 2 * math.pi / n
         xs, ys = x0 + r * np.cos(a), y0 + r * np.sin(a)
-        ok = (xs > margin) & (ys > margin) & (xs < arena_size - margin) & (ys < arena_size - margin)
+        ok = (xs > margin) & (ys > margin) & (xs < sx - margin) & (ys < sy - margin)
         if ok.any():
             d = prior.dist_at(xs[ok], ys[ok])
             if d.max() >= clearance:
@@ -52,11 +54,13 @@ def clean_route(prior, route, clearance, arena_size, min_spacing=0.6):
 
 
 def known_lanes(arena, start, prior, n_lanes=3, clearance=0.8, **kw):
-    return clean_route(prior, W.lanes(arena, start, n_lanes=n_lanes, **kw), clearance, arena.size)
+    return clean_route(prior, W.lanes(arena, start, n_lanes=n_lanes, **kw), clearance,
+                       (arena.size_x, arena.size_y))
 
 
 def known_ring(arena, prior, entry_xy, heading, clearance=0.8, **kw):
-    return clean_route(prior, W.ring(arena, entry_xy, heading, **kw), clearance, arena.size)
+    return clean_route(prior, W.ring(arena, entry_xy, heading, **kw), clearance,
+                       (arena.size_x, arena.size_y))
 
 
 # ---------------------------------------------------------------- coverage -------------------
@@ -89,9 +93,8 @@ def _visible(prior, origins, headings, targets, view_range, half_fov, step):
 
 def coverage(prior, arena, route, view_range=4.0, fov_deg=110.0, cell=0.5, sample=1.0):
     """Search-area cells (free in the map) and whether the route sees them. Returns (targets, seen)."""
-    lo, hi = arena.search_min, arena.search_max
-    g = np.arange(lo + cell / 2, hi, cell)
-    X, Y = np.meshgrid(g, g)
+    x0, y0, x1, y1 = arena.search_box
+    X, Y = np.meshgrid(np.arange(x0 + cell / 2, x1, cell), np.arange(y0 + cell / 2, y1, cell))
     targets = np.stack([X.ravel(), Y.ravel()], axis=1)
     targets = targets[prior.dist_at(targets[:, 0], targets[:, 1]) > 0.15]
     dense = _densify(route, sample)
@@ -112,8 +115,8 @@ def gap_viewpoints(prior, arena, route, max_extra=6, clearance=0.9, view_range=3
     if len(unseen) == 0:
         return []
     m = 1.0
-    g = np.arange(m, arena.size - m + 1e-9, candidate_step)
-    X, Y = np.meshgrid(g, g)
+    X, Y = np.meshgrid(np.arange(m, arena.size_x - m + 1e-9, candidate_step),
+                       np.arange(m, arena.size_y - m + 1e-9, candidate_step))
     cands = np.stack([X.ravel(), Y.ravel()], axis=1)
     cands = cands[prior.dist_at(cands[:, 0], cands[:, 1]) >= clearance]
     # what each candidate would see of the unseen cells (all round: the car will turn towards it)

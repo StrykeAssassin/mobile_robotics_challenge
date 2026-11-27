@@ -83,7 +83,7 @@ def arena_mask(grid, arena, margin, factor):
     c, s = math.cos(arena.start.yaw), math.sin(arena.start.yaw)
     ax = arena.start.x + c * X - s * Y
     ay = arena.start.y + s * X + c * Y
-    return (ax > margin) & (ax < arena.size - margin) & (ay > margin) & (ay < arena.size - margin)
+    return (ax > margin) & (ax < arena.size_x - margin) & (ay > margin) & (ay < arena.size_y - margin)
 
 
 def frontier_clusters(grid, arena, margin=1.0, factor=2, min_cells=6):
@@ -152,7 +152,8 @@ class MapperLogic(object):
         self.odometer = 0.0
         self.last_u = 0.0
         if self.p.n_lanes <= 0:
-            width = arena.search_max - arena.search_min
+            x0, y0, x1, y1 = arena.search_box
+            width = min(x1 - x0, y1 - y0)
             self.p.n_lanes = 3 if 2.2 * self.p.turn_radius <= width / 3.0 else 2
 
     def log(self, now, text):

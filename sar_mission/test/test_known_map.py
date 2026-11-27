@@ -153,8 +153,13 @@ def test_mission_takes_nearest_allowed_exit():
     assert m.state == EXIT and m.exit_colour == 'green'
     m2 = MissionLogic(MissionParams(start_on='immediate'), arena, [(10, 10)], lambda xy, h: [(10, 10)], gates)
     m2.update(0.0, pose)
-    m2._start_exit(1.0, pose, {'allowed': ['red']}, {}, 'test')
-    assert m2.exit_colour == 'red'
+    m2._start_exit(1.0, pose, {'allowed': ['blue']}, {}, 'test')
+    assert m2.exit_colour == 'blue'
+    # the start zone (red, SW) is never an exit, even if a star seems to say so
+    m3 = MissionLogic(MissionParams(start_on='immediate'), arena, [(10, 10)], lambda xy, h: [(10, 10)], gates)
+    m3.update(0.0, pose)
+    m3._start_exit(1.0, pose, {'allowed': ['red']}, {}, 'test')
+    assert m3.exit_colour != 'red'
 
 
 def test_course_file(tmp_path):

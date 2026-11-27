@@ -6,7 +6,14 @@ Subscribes: /sar/detections (String JSON, from board_detector or fake_detector)
             optional: ZED ObjectsStamped (person detections as a backup position source)
 Publishes:  /sar/targets (String JSON: {"targets": [...arena frame...], "candidates": [...odom frame...]})
             /sar/target_markers (MarkerArray, for rviz)
-Writes:     targets.csv (arena frame) every second, so the result survives a crash.
+Writes (every second, atomically, so the result survives a crash; see core/semantic_map.py):
+            answer_file    THE file the judges read: "x,y,class", at most 12 lines, best first, in the
+                           world frame given at the start (answer_frame: start / zone / arena / custom).
+                           Cleared when the node starts (a restart clears the answer file).
+            run_dir/       semantic map for the mapping bonus, every map_period s and at shutdown:
+                           map.pgm/.yaml (the live grid from map_topic), map_targets.json,
+                           map_semantic.png (grid + targets by class + the car's track)
+            csv_path       every track with details (debugging, arena frame)
 """
 import csv
 import math
@@ -14,7 +21,7 @@ import os
 import time
 
 import numpy as np
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
@@ -22,6 +29,8 @@ from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
 
 from ..core.perception import bbox_point, board_normal
+from ..core import semantic_map as SM
+from ..core.score import answer_frame
 from ..core.tracker import TARGET_CLASSES, TargetTracker, probs_from_label
 from . import ros_utils as U
 
@@ -43,7 +52,21 @@ class TargetTrackerNode(Node):
         self.good_conf = float(U.param(self, 'good_conf', 0.8))
         self.recheck = bool(U.param(self, 'recheck', True))
         self.min_board_px = int(U.param(self, 'min_board_px', 18))
-        self.csv_path = os.path.expanduser(U.param(self, 'csv_path', '~/sar_targets.csv'))
+        self.csv_path = os.path.expanduser(U.param(self, 'csv_path', '~/sar_run/tracks.csv'))
+        self.answer_path = os.path.expanduser(U.param(self, 'answer_file', '~/sar_run/answer.csv'))
+        self.answer_header = bool(U.param(self, 'answer_header', True))
+        self.frame_name = str(U.param(self, 'answer_frame', 'start'))
+        self.to_answer = answer_frame(self.arena, self.frame_name,
+                                      list(U.param(self, 'answer_origin', [0.0, 0.0, 0.0])))
+        self.run_dir = os.path.expanduser(U.param(self, 'run_dir', '~/sar_run'))
+        self.map_period = float(U.param(self, 'map_period', 10.0))
+        self.grid_msg = None
+        self.trail = []
+        # a new run starts with an empty answer file (scoring sheet 4.2: a restart clears it)
+        try:
+            SM.write_answer(self.answer_path, [], self.answer_header)
+        except OSError as e:
+            self.get_logger().error('cannot write the answer file %s: %s' % (self.answer_path, e))
         self.depth = None
         self.depth_frame = ''
         self.K = None
@@ -69,11 +92,22 @@ class TargetTrackerNode(Node):
         self.create_timer(0.5, self.publish)
         self.create_timer(2.0, self.merge)
         self.create_timer(1.0, self.write_csv)
-        self.get_logger().info('target_tracker ready, writing %s' % self.csv_path)
+        self.create_timer(1.0, self.write_answer)
+        self.create_subscription(OccupancyGrid, U.param(self, 'map_topic', '/sar/grid'), self.on_grid,
+                                 U.RELIABLE_QOS)
+        if self.map_period > 0:
+            self.create_timer(self.map_period, self.save_map)
+        self.get_logger().info('target_tracker ready: answer file %s (%s frame), semantic map in %s'
+                               % (self.answer_path, self.frame_name, self.run_dir))
 
     # ---- inputs --------------------------------------------------------------------------------
     def on_odom(self, msg):
         self.pose, _ = U.pose_from_odom(msg)
+        if not self.trail or math.hypot(self.pose.x - self.trail[-1][0], self.pose.y - self.trail[-1][1]) > 0.1:
+            self.trail.append((self.pose.x, self.pose.y))
+
+    def on_grid(self, msg):
+        self.grid_msg = msg
 
     def on_info(self, msg):
         self.K = U.intrinsics(msg)
@@ -215,6 +249,48 @@ class TargetTrackerNode(Node):
             txt.text = '%d %s %.2f' % (t.id, c if confirmed else '?', p)
             arr.markers.append(txt)
         self.marker_pub.publish(arr)
+
+    def answer_entries(self):
+        """The answer list in the judges' frame, plus the start-frame position for the map."""
+        out = []
+        for e in self.tracker.answer(None, n=12):
+            fx, fy = self.to_answer(e['x'], e['y'])
+            r = SM.entry_record(dict(e, x=round(fx, 2), y=round(fy, 2)), (e['x'], e['y']))
+            out.append(r)
+        return out
+
+    def write_answer(self):
+        try:
+            SM.write_answer(self.answer_path, self.answer_entries(), self.answer_header)
+        except OSError as e:
+            self.get_logger().warn('could not write %s: %s' % (self.answer_path, e), throttle_duration_sec=30.0)
+
+    def save_map(self):
+        """Mapping bonus: the grid built during this run, with every target found marked on it."""
+        g = self.grid_msg
+        if g is None:
+            self.get_logger().warn('no grid on the map topic yet: semantic map not saved',
+                                   throttle_duration_sec=60.0)
+            return
+        if g.header.frame_id and g.header.frame_id != self.odom_frame:
+            self.get_logger().warn('map frame %s differs from %s: target marks may be offset'
+                                   % (g.header.frame_id, self.odom_frame), throttle_duration_sec=120.0)
+        info = g.info
+        data = np.asarray(g.data, dtype=np.int16).reshape(info.height, info.width)
+        entries = self.answer_entries()
+        try:
+            ok = SM.save_all(self.run_dir, data, info.resolution, (info.origin.position.x, info.origin.position.y),
+                             entries, self.frame_name, trail=list(self.trail),
+                             title='%d targets  %s' % (len(entries), time.strftime('%H:%M:%S')))
+            if not ok:
+                self.get_logger().warn('OpenCV missing: map_semantic.png not drawn (pgm + json saved)',
+                                       throttle_duration_sec=600.0)
+        except OSError as e:
+            self.get_logger().warn('could not save the semantic map: %s' % e, throttle_duration_sec=30.0)
+
+    def shutdown(self):
+        self.write_answer()
+        self.save_map()
 
     def write_csv(self):
         rows = [r for r in self.tracker.summary(self.arena.to_arena) if r['class'] in TARGET_CLASSES + ('UNKNOWN',)]

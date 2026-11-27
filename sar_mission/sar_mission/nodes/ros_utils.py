@@ -36,17 +36,24 @@ def course_from_params(node):
 
 
 def arena_from_params(node):
-    size = float(param(node, 'arena_size', 20.0))
-    smin = float(param(node, 'search_min', 5.0))
-    smax = float(param(node, 'search_max', 15.0))
+    raw = param(node, 'arena_size', [10.0, 7.0])
+    size = list(raw) if isinstance(raw, (list, tuple)) else float(raw)
+    box = list(param(node, 'search_box', []) or [])
+    smin = float(param(node, 'search_min', -1.0))
+    smax = float(param(node, 'search_max', -1.0))
+    zone = float(param(node, 'zone_size', 1.5))
     corner = str(param(node, 'start_corner', 'SW')).upper()
     heading = str(param(node, 'start_heading', 'edge'))
-    inset = float(param(node, 'start_inset', 1.5))
+    inset = float(param(node, 'start_inset', zone / 2.0))
     start = start_pose_from_corner(corner, size, inset, heading)
     course = course_from_params(node)
     if course and corner in course['starts']:
         start = course['starts'][corner]          # the tape-measured start mark
-    return ArenaFrame(start, size, smin, smax)
+    if len(box) == 4:
+        return ArenaFrame(start, size, search_box=box, zone=zone)
+    if smin >= 0 and smax > smin:
+        return ArenaFrame(start, size, smin, smax, zone=zone)
+    return ArenaFrame(start, size, zone=zone)
 
 
 def prior_from_params(node, arena):
@@ -56,7 +63,7 @@ def prior_from_params(node, arena):
         return None
     from ..core.prior_map import PriorMap
     try:
-        pm = PriorMap.from_files(path, arena_size=arena.size,
+        pm = PriorMap.from_files(path, arena_size=(arena.size_x, arena.size_y),
                                  res=float(param(node, 'prior_resolution', 0.05)))
     except (OSError, KeyError, ValueError) as e:
         node.get_logger().error('could not load prior_map %s: %s -> running WITHOUT the map' % (path, e))

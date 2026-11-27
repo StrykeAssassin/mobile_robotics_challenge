@@ -34,7 +34,26 @@ class MissionManager(Node):
         overrun = float(U.param(self, 'lane_overrun', 1.0))
         axis = U.param(self, 'lane_axis', 'auto')
         prior = U.prior_from_params(self, self.arena)
-        if prior is not None:
+        mode = str(U.param(self, 'route_mode', 'auto'))
+        if mode == 'auto':
+            mode = 'loops' if max(self.arena.size_x, self.arena.size_y) <= 12.0 else 'lanes'
+        if mode == 'loops':
+            # the 10 x 7 m arena: laps (ring, then the pattern), see core/waypoints.ArenaRoutes
+            ar = W.ArenaRoutes(self.arena, self.arena.start,
+                               pattern=list(U.param(self, 'lap_pattern', ['ring', 'figure8'])),
+                               inset=float(U.param(self, 'ring_inset', 1.8)),
+                               corner_cut=float(U.param(self, 'ring_corner', 1.65)),
+                               f8_radius=float(U.param(self, 'figure8_radius', 1.7)))
+            if prior is not None:
+                from ..core.known_route import clean_route
+                clr = float(U.param(self, 'route_clearance', 0.6))
+                dims = (self.arena.size_x, self.arena.size_y)
+                lanes = clean_route(prior, ar.first, clr, dims)
+                ring = lambda xy, hd: clean_route(prior, ar.ring(xy, hd), clr, dims)
+            else:
+                lanes, ring = ar.first, ar.ring
+            self.get_logger().info('lap routes: first lap %.0f m, pattern %s' % (W.route_length(lanes), ar.pattern))
+        elif prior is not None:
             kr = KnownRoutes(self.arena, prior, n_lanes=n_lanes, clearance=float(U.param(self, 'route_clearance', 0.8)),
                              ring_inset=inset, ring_mid_pull=pull, lane_overrun=overrun, lane_axis=axis,
                              max_extra=int(U.param(self, 'max_gap_viewpoints', 6)))
@@ -57,7 +76,8 @@ class MissionManager(Node):
                  'inspect_budget', 'inspect_dwell', 'view_distance', 'pre_distance', 'gate_tolerance',
                  'gate_half_size', 'min_targets_for_shortcut', 'jump_threshold', 'wp_block_time',
                  'expected_cards', 'good_conf', 'route_inspect', 'cheap_dist', 'revisit_dwell', 'creep',
-                 'visit_extra', 'mopup_margin']
+                 'visit_extra', 'mopup_margin', 'geofence_margin', 'exit_approach_dist', 'mopup_visits', 'mat_max_offset', 'turn_back_on_block',
+                 'exit_via_route']
         defaults = MissionParams()
         kw = dict((n, type(getattr(defaults, n))(U.param(self, n, getattr(defaults, n)))) for n in names)
         kw['start_on'] = U.param(self, 'start_on', 'motion')

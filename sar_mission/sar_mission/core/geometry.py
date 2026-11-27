@@ -55,24 +55,39 @@ class Pose2D(object):
 CORNERS = ('SW', 'SE', 'NE', 'NW')
 
 
+def arena_dims(arena_size):
+    """(size_x, size_y) from a number (square) or a [x, y] pair."""
+    if isinstance(arena_size, (list, tuple, np.ndarray)):
+        if len(arena_size) == 1:
+            return float(arena_size[0]), float(arena_size[0])
+        return float(arena_size[0]), float(arena_size[1])
+    return float(arena_size), float(arena_size)
+
+
 def start_pose_from_corner(corner, arena_size=20.0, inset=1.5, heading='edge'):
     """Start pose in the arena frame.
 
-    Arena frame: origin at the SW corner of the 20 x 20 m arena, x to the east, y to the north.
-    The car sits at the centre of a 3 x 3 m corner start zone (inset 1.5 m).
-    heading='edge': square to the arena edge, driving anticlockwise along it
-                    (SW faces +x, SE faces +y, NE faces -x, NW faces -y).
+    Arena frame: origin at the SW corner of the arena, x to the east, y to the north.
+    arena_size is a number (square) or [size_x, size_y] (the challenge arena is 10 x 7 m).
+    The car sits at the centre of the corner start zone (inset = half the zone width).
+    heading='edge': along the arena's long side, into the arena
+                    (for a square: SW faces +x, SE faces +y, NE faces -x, NW faces -y).
     heading='diagonal': facing the arena centre.
     A number is taken as a yaw in degrees.
     """
     corner = corner.upper()
-    s = arena_size
-    pos = {'SW': (inset, inset), 'SE': (s - inset, inset),
-           'NE': (s - inset, s - inset), 'NW': (inset, s - inset)}[corner]
+    sx, sy = arena_dims(arena_size)
+    pos = {'SW': (inset, inset), 'SE': (sx - inset, inset),
+           'NE': (sx - inset, sy - inset), 'NW': (inset, sy - inset)}[corner]
     if heading == 'edge':
-        yaw = {'SW': 0.0, 'SE': math.pi / 2, 'NE': math.pi, 'NW': -math.pi / 2}[corner]
+        if abs(sx - sy) < 1e-6:
+            yaw = {'SW': 0.0, 'SE': math.pi / 2, 'NE': math.pi, 'NW': -math.pi / 2}[corner]
+        elif sx > sy:   # long side along x
+            yaw = 0.0 if corner in ('SW', 'NW') else math.pi
+        else:
+            yaw = math.pi / 2 if corner in ('SW', 'SE') else -math.pi / 2
     elif heading == 'diagonal':
-        yaw = math.atan2(s / 2 - pos[1], s / 2 - pos[0])
+        yaw = math.atan2(sy / 2 - pos[1], sx / 2 - pos[0])
     else:
         yaw = math.radians(float(heading))
     return Pose2D(pos[0], pos[1], yaw)
@@ -85,11 +100,21 @@ class ArenaFrame(object):
     start pose in the arena. So odom->arena is the start pose itself.
     """
 
-    def __init__(self, start_pose_arena, arena_size=20.0, search_min=5.0, search_max=15.0):
+    def __init__(self, start_pose_arena, arena_size=20.0, search_min=None, search_max=None,
+                 search_box=None, zone=1.5):
         self.start = start_pose_arena
-        self.size = float(arena_size)
-        self.search_min = float(search_min)
-        self.search_max = float(search_max)
+        self.size_x, self.size_y = arena_dims(arena_size)
+        self.size = max(self.size_x, self.size_y)   # legacy: square arenas only
+        self.zone = float(zone)
+        if search_box is not None:
+            self.search_box = tuple(float(v) for v in search_box)
+        elif search_min is not None and search_max is not None:
+            self.search_box = (float(search_min), float(search_min),
+                               min(float(search_max), self.size_x), min(float(search_max), self.size_y))
+        else:   # the whole arena (the 10 x 7 challenge: cards anywhere 1 m clear of the zones)
+            self.search_box = (0.0, 0.0, self.size_x, self.size_y)
+        self.search_min = self.search_box[0]
+        self.search_max = self.search_box[2]
 
     def to_odom(self, ax, ay):
         return self.start.inverse_apply(ax, ay)
@@ -104,11 +129,27 @@ class ArenaFrame(object):
         return wrap(yaw_arena - self.start.yaw)
 
     def inside(self, ax, ay, margin=0.0):
-        return (-margin <= ax <= self.size + margin) and (-margin <= ay <= self.size + margin)
+        return (-margin <= ax <= self.size_x + margin) and (-margin <= ay <= self.size_y + margin)
+
+    def clamp(self, ax, ay, margin=0.0):
+        return (min(max(ax, margin), self.size_x - margin), min(max(ay, margin), self.size_y - margin))
+
+    def in_zone(self, ax, ay, pad=0.0):
+        """Inside one of the four corner zones (grown by pad)."""
+        z = self.zone + pad
+        nx = ax < z or ax > self.size_x - z
+        ny = ay < z or ay > self.size_y - z
+        return nx and ny
+
+    def corner_xy(self, corner, inset=None):
+        inset = self.zone / 2.0 if inset is None else inset
+        sx, sy = self.size_x, self.size_y
+        return {'SW': (inset, inset), 'SE': (sx - inset, inset),
+                'NE': (sx - inset, sy - inset), 'NW': (inset, sy - inset)}[corner.upper()]
 
     @property
     def centre(self):
-        return self.size / 2.0, self.size / 2.0
+        return self.size_x / 2.0, self.size_y / 2.0
 
 
 def segment_point_distance(p, a, b):

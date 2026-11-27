@@ -8,7 +8,7 @@ from sar_mission.core.tracker import TargetTracker, probs_from_label
 
 def make(params=None, corner='SW'):
     start = start_pose_from_corner(corner)
-    arena = ArenaFrame(start)
+    arena = ArenaFrame(start, 20.0, 5.0, 15.0, zone=3.0)      # the older 20 x 20 m brief
     lanes = W.lanes(arena, start)
     ring = lambda xy, hd: W.ring(arena, xy, hd)
     gates = W.default_gates(arena)
@@ -17,7 +17,7 @@ def make(params=None, corner='SW'):
 
 def test_lanes_cover_search_area_with_drivable_uturns():
     start = start_pose_from_corner('SW')
-    arena = ArenaFrame(start)
+    arena = ArenaFrame(start, 20.0, 5.0, 15.0, zone=3.0)
     lanes = W.lanes(arena, start, n_lanes=3)
     xs = [p[0] for p in lanes]
     ys = [p[1] for p in lanes]
@@ -45,9 +45,9 @@ def test_timers_and_exit():
 def test_forced_exit_without_colour_goes_to_nearest_gate():
     m, arena = make(MissionParams(start_on='immediate', jump_threshold=100.0))
     m.update(0.0, Pose2D(0, 0, 0))
-    m.update(1021.0, Pose2D(8.0, 8.0, 0))        # arena (9.5, 9.5): nearest gate is still SW
-    assert m.state == EXIT
-    assert m.exit_target == arena.to_odom(1.5, 1.5)
+    m.update(1021.0, Pose2D(7.0, 9.0, 0))        # arena (8.5, 10.5): SW (the start) is nearest,
+    assert m.state == EXIT                       # but the exit is another corner: NW
+    assert m.exit_target == arena.to_odom(1.5, 18.5)
 
 
 def test_inspect_detour_and_resume():

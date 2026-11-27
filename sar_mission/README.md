@@ -5,39 +5,29 @@ One ROS 2 package for the 50.047 search and rescue challenge. It runs:
 - in **Gazebo** on the laptop (WSL2 Ubuntu 22.04, ROS 2 Humble), using a TurtleBot3 restricted to drive like the car;
 - in a **plain-Python simulator** that needs no ROS at all (`tools/offline_sim.py`).
 
-The plan is the Phase 1 "Lanes + Ring" strategy, adapted to the 12 cards on the course:
-1. Drive 3 lawnmower lanes through the 10 × 10 m search area, then a loop 3 m inside the arena edge.
-   Cards are read on the way (the card recognizer works from ~4 m). The car only stops for a card
-   that is cheap to look at (lined up in front of it, or close and ahead); others stay on the map.
-2. Mop-up: revisit cards seen but not read, from a direction not tried yet (one big move, a short look,
-   at most one creep closer); then give confirmed cards whose readings averaged under 80% one more
-   look, lowest first (SAFE cards with an unsure star too); then, while fewer than 12 are confirmed,
-   drive another lap.
-3. Leave as soon as all 12 cards are confirmed, rechecked and the exit is known; otherwise the timers
-   decide (search ends 15:00, forced exit 17:00). Exit: the nearest one whose colour matches a star on
-   a SAFE card (`exit_rule: stars`; the older single-exit-sign rule is still there as `exit_rule: sign`).
-Settings: `expected_cards`, `good_conf`, `route_inspect` and friends in `config/car.yaml`.
+**The scored run (scoring sheet, 27 Nov): see CHALLENGE.md.** A 10 × 7 m walled arena with 1.5 m
+corner zones, 12 targets, 10 minutes. The car laps the arena (a ring 1.5 m from the walls, then
+figures of eight and rings in turn), reads cards as it passes, then visits cards it saw but couldn't
+read, and leaves along a wall into the zone shown by the star (never its own start zone). It writes
+the judges' answer file (`~/sar_run/answer.csv`, at most 12 lines, best first) every second and saves
+the semantic map for the mapping bonus (`~/sar_run/map_semantic.png` and friends).
 
-Simulator, 12 cards, saved map, course rebuilt with pieces moved up to 20 cm, 10 layouts each
-(`tools/offline_sim.py --seeds 0-9 --known-map --shift 0.2 [--wonky] [--reverse] [--mission old]`):
+Simulator, 16 random layouts of the sheet's arena: mean score **81 of 110** (good steering) and
+**77** (wonky car), 9.5 of 12 classes right, the right exit in 10–12 of 16 runs, out at about 7:30.
+Details and what loses points: CHALLENGE.md.
 
-| Car | Cards found (of 12), old → new | All 12 found | Wrong class | Duplicate reports | Correct exit | Run time |
-|---|---|---|---|---|---|---|
-| Wonky, can reverse | 8.9 → **10.5** | 0 → 2 runs | 4 → 6 | 12 → 0 | 10 → 10 | 534 → 931 s |
-| Good steering, can reverse | 9.6 → **10.2** | 0 → 1 | 5 → 4 | 13 → 1 | 10 → 10 | 558 → 911 s |
-| Wonky, no reverse | 6.9 → **9.8** | 0 → 2 | 4 → 6 | 18 → 0 | 7 → 8 | 720 → 987 s |
-
-"Old" stopped at every card and left once it had 4 cards of all four classes. The new rules use the
-time until 15:00 when cards are missing, which is why runs are longer. Missed cards are mostly two
-cards of the same class standing within ~0.5 m (counted as one) and cards whose printed side faces
-an obstacle.
+The older 20 × 20 m plan ("Lanes + Ring": lawnmower lanes through the 10 × 10 m search area, then a
+loop 3 m inside the edge) is still there (`route_mode: lanes`, `tools/offline_sim.py --course old`).
+Card rules for 12 cards: read on the way, revisit unread cards from a direction not tried yet, one
+recheck for cards whose readings averaged under 80% (SAFE cards with an unsure star too), more laps
+while fewer than 12 are confirmed, leave early once all 12 are in.
 
 **Known-map mode** (KNOWN_MAP.md): give the saved course map (`prior_map:=...`) and the robot localizes
 against it, plans around mapped obstacles, finds new objects by map difference and adds viewpoints
 where the map says the route can't see. Built for a course that is rebuilt every day (pieces moved
 10-30 cm).
 
-A card is confirmed after several agreeing readings (`target_tracker`: at least 3, combined confidence 70%). Targets are reported in the arena frame: origin at the SW corner, x east, y north, in metres.
+A card is confirmed after several agreeing readings (`target_tracker`: at least 3, combined confidence 70%). The answer file is in the frame set by `answer_frame` (default: the car's start pose, x along its initial heading); `tracks.csv` has every track in the arena frame (origin SW corner, x east, y north).
 
 ## How it fits together
 
@@ -54,7 +44,7 @@ ZED odom ───────────────────────�
 | `depth_scan` | Fits the floor plane in every depth frame and turns everything 3 cm–0.8 m above it into a LaserScan. Missing depth close in front is treated as blocked. | Camera model from Tutorial 6 |
 | `path_planner` | Builds a live log-odds grid from the scan. Plans a straight line if it's clear, otherwise A* with inflation. | HW3 mapper, HW2 A* (bugs fixed) |
 | `local_driver` | Pure pursuit + PID. Picks among left / straight / right arcs that stay clear of obstacles and the arena boundary, even if the real turn is 25% tighter or wider than planned. Has watchdog and stuck detection. | HW1 PID, HW3 explore logic |
-| `target_tracker` | Places each detection in 3D using depth and TF. Fuses sightings: weighted position, log-probability class votes, and a board-facing estimate. Writes `~/sar_targets.csv`. | HW3 least squares, HW4 weighting |
+| `target_tracker` | Places each detection in 3D using depth and TF. Fuses sightings: weighted position, log-probability class votes, and a board-facing estimate. Writes the answer file and the semantic map (`~/sar_run/`). | HW3 least squares, HW4 weighting |
 | `exit_detector` | Exit sign colour vote, plus a map of coloured floor mats (only pixels on the floor count, so cones and the sign are excluded). | — |
 | `mission_manager` | State machine with timers. Prints the final report. | — |
 | `board_detector` | Card recognizer (templates of the real cards, no training; **CARDS.md**), optional YOLOv8 detector + crop classifier via OpenCV DNN (`tools/TRAINING.md`). | HW4 detection idea |
@@ -75,7 +65,7 @@ All the logic is in `sar_mission/core/` (plain Python + numpy, no ROS). The node
 
 ```bash
 cd sar_mission
-python3 -m pytest -q test                          # 35 unit tests
+python3 -m pytest -q test                          # 64 unit tests
 python3 tools/offline_sim.py --seed 3 --plot run3.png -v
 python3 tools/offline_sim.py --seeds 0-19          # benchmark table
 python3 tools/offline_sim.py --seeds 0-9 --turn-radius 1.25 --lanes 4    # "what if" after day-1 tests

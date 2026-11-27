@@ -13,7 +13,7 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 import tf2_ros
 
-from ..core.driver import DriverLogic, DriverParams, fence_points
+from ..core.driver import DriverLogic, DriverParams, mission_fence
 from ..core.scan_utils import Scan
 from ..core.steering import SteeringShaper
 from . import ros_utils as U
@@ -41,12 +41,18 @@ class LocalDriver(Node):
             min_free=float(U.param(self, 'min_free', 0.6)),
             stop_dist=float(U.param(self, 'stop_dist', 0.45)),
             reverse_allowed=bool(U.param(self, 'reverse_allowed', False)),
+            escape_clearance=float(U.param(self, 'escape_clearance', 0.2)),
+            final_approach=float(U.param(self, 'final_approach', 1.6)),
             steer_options=opts,
         )
         arena = U.arena_from_params(self)
-        fence = fence_points(arena, float(U.param(self, 'fence_margin', 0.6))) \
-            if U.param(self, 'use_fence', True) else None
+        self.arena = arena
+        self.use_fence = bool(U.param(self, 'use_fence', True))
+        self.fence_margin = float(U.param(self, 'fence_margin', 0.0))
+        self.zone_keep_out = bool(U.param(self, 'zone_keep_out', True))
+        fence = mission_fence(arena, self.fence_margin, self.zone_keep_out) if self.use_fence else None
         self.logic = DriverLogic(dp, fence=fence)
+        self.exit_open = False
         self.shaper = SteeringShaper(mode, lock_angular=float(U.param(self, 'lock_angular', 0.15)),
                                      max_angular=float(U.param(self, 'max_angular', 0.19)))
         self.lin = {0: 0.0, 1: float(U.param(self, 'slow_linear', 0.3)),
@@ -64,6 +70,10 @@ class LocalDriver(Node):
                                  U.SENSOR_QOS)
         self.create_subscription(LaserScan, U.param(self, 'scan_topic', '/sar/scan'), self.on_scan, U.SENSOR_QOS)
         self.create_subscription(Path, '/sar/path', self.on_path, U.RELIABLE_QOS)
+        self.create_subscription(Path, '/sar/route', self.on_route, U.RELIABLE_QOS)
+        self.create_subscription(String, '/sar/state', self.on_state, U.RELIABLE_QOS)
+        self.mission_state = ''
+        self.route_end = None
         self.cmd_pub = self.create_publisher(Twist, U.param(self, 'cmd_topic', '/cmd_vel'), U.RELIABLE_QOS)
         self.status_pub = self.create_publisher(String, '/sar/driver_status', U.RELIABLE_QOS)
         self.create_timer(1.0 / float(U.param(self, 'rate', 10.0)), self.tick)
@@ -86,6 +96,21 @@ class LocalDriver(Node):
     def on_path(self, msg):
         self.logic.set_path(U.path_points(msg))
         self.t_path = U.now_sec(self)
+
+    def on_route(self, msg):
+        pts = U.path_points(msg)
+        self.route_end = pts[-1] if pts else self.route_end
+
+    def on_state(self, msg):
+        st = msg.data.split()[0] if msg.data else ''
+        if st == 'EXIT' and self.mission_state != 'EXIT':
+            self.exit_open = False
+        self.mission_state = st
+        # leaving: open the exit zone in the keep-out fence (the route ends at the exit gate)
+        if st == 'EXIT' and self.use_fence and self.route_end is not None and not self.exit_open:
+            self.logic.set_fence(mission_fence(self.arena, self.fence_margin, self.zone_keep_out, self.route_end))
+            self.exit_open = True
+            self.get_logger().info('exit zone opened in the fence')
 
     def stop(self):
         self.cmd_pub.publish(Twist())

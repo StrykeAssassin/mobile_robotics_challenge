@@ -17,7 +17,7 @@ import os
 
 import numpy as np
 
-from .geometry import Pose2D, start_pose_from_corner
+from .geometry import Pose2D, arena_dims, start_pose_from_corner
 
 FREE, UNKNOWN, OCC = 0, 1, 2
 
@@ -190,10 +190,13 @@ class PriorMap(object):
         """Resample this map (cells expressed in frame F) into the arena frame, where
         arena_point = T.apply(F_point). Nearest-neighbour."""
         res = res or self.res
-        lo, hi = -margin, arena_size + margin
-        n = int(math.ceil((hi - lo) / res))
-        cx = lo + (np.arange(n) + 0.5) * res
-        X, Y = np.meshgrid(cx, cx)                         # arena cell centres (rows = y)
+        sx, sy = arena_dims(arena_size)
+        lo = -margin
+        nx = int(math.ceil((sx + 2 * margin) / res))
+        ny = int(math.ceil((sy + 2 * margin) / res))
+        cx = lo + (np.arange(nx) + 0.5) * res
+        cy = lo + (np.arange(ny) + 0.5) * res
+        X, Y = np.meshgrid(cx, cy)                         # arena cell centres (rows = y)
         # arena -> F
         c, s = math.cos(T.yaw), math.sin(T.yaw)
         dx, dy = X - T.x, Y - T.y
@@ -202,20 +205,20 @@ class PriorMap(object):
         col = np.floor((fx - self.ox) / self.res).astype(int)
         row = np.floor((fy - self.oy) / self.res).astype(int)
         ok = (row >= 0) & (row < self.rows) & (col >= 0) & (col < self.cols)
-        out = np.full((n, n), UNKNOWN, dtype=np.uint8)
+        out = np.full((ny, nx), UNKNOWN, dtype=np.uint8)
         out[ok] = self.state[row[ok], col[ok]]
         return PriorMap(out, res, (lo, lo), self.max_dist)
 
     @classmethod
     def from_layout(cls, layout, res=0.05, walls=True, margin=1.0):
         """Rasterise a simulated layout's obstacles (not the boards: they move) for the offline sim."""
-        s = layout['arena']
+        sx, sy = arena_dims(layout['arena'])
         lo = -margin
-        n = int(math.ceil((s + 2 * margin) / res))
-        cx = lo + (np.arange(n) + 0.5) * res
-        X, Y = np.meshgrid(cx, cx)
-        state = np.full((n, n), FREE, dtype=np.uint8)
-        outside = (X < 0) | (Y < 0) | (X > s) | (Y > s)
+        cx = lo + (np.arange(int(math.ceil((sx + 2 * margin) / res))) + 0.5) * res
+        cy = lo + (np.arange(int(math.ceil((sy + 2 * margin) / res))) + 0.5) * res
+        X, Y = np.meshgrid(cx, cy)
+        state = np.full(X.shape, FREE, dtype=np.uint8)
+        outside = (X < 0) | (Y < 0) | (X > sx) | (Y > sy)
         state[outside] = UNKNOWN
         for o in layout['obstacles']:
             if o['type'] == 'cone':
@@ -228,8 +231,8 @@ class PriorMap(object):
             state[m] = OCC
         if walls:
             w = res * 1.5
-            edge = ((np.abs(X) < w) | (np.abs(Y) < w) | (np.abs(X - s) < w) | (np.abs(Y - s) < w)) & \
-                   (X > -w) & (Y > -w) & (X < s + w) & (Y < s + w)
+            edge = ((np.abs(X) < w) | (np.abs(Y) < w) | (np.abs(X - sx) < w) | (np.abs(Y - sy) < w)) & \
+                   (X > -w) & (Y > -w) & (X < sx + w) & (Y < sy + w)
             state[edge] = OCC
         pm = cls(state, res, (lo, lo))
         pm.meta = {'frame': 'arena', 'source': 'layout %s' % layout.get('seed')}

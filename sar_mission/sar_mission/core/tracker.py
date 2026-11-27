@@ -390,6 +390,54 @@ class TargetTracker(object):
             })
         return rows
 
+    def answer(self, to_frame=None, n=12, min_obs=3, dedupe=0.6):
+        """The answer list the judges read: at most n entries (only the first N count), best first.
+          1. confirmed target cards, highest reading quality first;
+          2. then cards read but not confirmed yet, most likely class first (no penalty for a wrong
+             class, and the position still earns its points);
+          3. then cards seen (n_obs >= min_obs) but never read: the position can still score, so they
+             are listed with a guessed class (the class with the fewest entries so far).
+        Entries closer than `dedupe` m to a better one are dropped (one entry per card).
+        Each entry: {id, x, y, class, confidence, confirmed, quality, rank}."""
+        conf, read, seen = [], [], []
+        for t in self.tracks:
+            c, p = t.best()
+            if t.n_class_obs > 0 and not self.is_target(t):
+                continue
+            if t.n_class_obs > 0 and self.confirmed(t):
+                conf.append((-t.quality(), -p, t))
+            elif t.n_class_obs > 0:
+                read.append((-p, -t.n_class_obs, t))
+            elif t.n_obs >= min_obs and t.n_back == 0:
+                seen.append((-t.n_obs, t.id, t))
+        out = []
+        counts = dict((c, 0) for c in TARGET_CLASSES)
+        for group, guess in ((sorted(conf, key=lambda e: e[:2]), False),
+                             (sorted(read, key=lambda e: e[:2]), False),
+                             (sorted(seen, key=lambda e: e[:2]), True)):
+            for e in group:
+                if len(out) >= n:
+                    break
+                t = e[-1]
+                if any(float(np.hypot(*(t.xy - np.array(o['_xy'])))) < dedupe for o in out):
+                    continue
+                if guess:
+                    c, p = min(TARGET_CLASSES, key=lambda k: (counts[k], TARGET_CLASSES.index(k))), 0.0
+                else:
+                    c, p = t.best()
+                counts[c] += 1
+                x, y = t.xy
+                if to_frame is not None:
+                    x, y = to_frame(x, y)
+                out.append({'id': t.id, 'x': round(float(x), 2), 'y': round(float(y), 2), 'class': c,
+                            'confidence': round(float(p), 3), 'confirmed': bool(self.confirmed(t)),
+                            'quality': round(t.quality(), 3), 'guessed': guess, 'star': t.star(),
+                            '_xy': (float(t.xy[0]), float(t.xy[1]))})
+        for i, o in enumerate(out):
+            o['rank'] = i + 1
+            del o['_xy']
+        return out
+
     def allowed_exits(self):
         """Star colours of confirmed SAFE cards = the exits we may use."""
         out = set()

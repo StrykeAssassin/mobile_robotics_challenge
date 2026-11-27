@@ -71,7 +71,7 @@ def find_new_objects(occupied_odom, cell_xy_fn, prior, arena, robot_xy=None, par
     ox, oy = cell_xy_fn(rr, cc)
     ax, ay = arena.to_arena(ox, oy) if np.ndim(ox) == 0 else _to_arena_vec(arena, ox, oy)
     inside = (ax > -p.arena_margin) & (ay > -p.arena_margin) & \
-             (ax < arena.size + p.arena_margin) & (ay < arena.size + p.arena_margin)
+             (ax < arena.size_x + p.arena_margin) & (ay < arena.size_y + p.arena_margin)
     far = prior.dist_at(ax, ay) > p.tol
     keep = inside & far
     if robot_xy is not None:

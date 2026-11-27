@@ -41,6 +41,7 @@ class MissionParams(object):
         self.wp_pass_window = 2.5
         self.wp_block_time = 20.0
         self.turn_radius = 1.65          # skip route points the car can't reach without a loop
+        self.skip_unreachable = True     # (laps in the small arena: False, skipping cuts corners)
         self.inspect_max_dist = 5.0
         self.inspect_cap = 35.0
         self.inspect_budget = 420.0
@@ -54,7 +55,7 @@ class MissionParams(object):
         self.min_targets_for_shortcut = 4    # only used when expected_cards is 0 (unknown)
         self.expected_cards = 12         # cards on the course; 0 = unknown (old early-exit rule)
         self.good_conf = 0.8             # confirmed cards below this get one recheck (if time allows)
-        self.route_inspect = 'cheap'     # stop for cards on the route: 'cheap' only, or 'always' (old)
+        self.route_inspect = 'cheap'     # stop for cards on the route: 'cheap', 'none' or 'always' (old)
         self.cheap_dist = 3.0            # 'cheap': card closer than this and roughly ahead
         self.revisit_dwell = 3.0         # look this long at a revisit/recheck before creeping closer
         self.creep = 0.5                 # fine correction: move this much closer, once
@@ -68,6 +69,10 @@ class MissionParams(object):
         self.start_on = 'motion'
         self.start_motion = 0.15
         self.geofence_margin = 0.8
+        self.turn_back_on_block = False  # leaving: a blocked waypoint -> go round the other way
+        self.mat_max_offset = 0.0       # >0: ignore mat sightings this far from the configured zone
+        self.mopup_visits = True         # MOPUP: drive to unread / low-confidence cards (False: laps only)
+        self.exit_via_route = False      # leave along the current lap until it passes the exit approach
         for k, v in kw.items():
             if not hasattr(self, k):
                 raise AttributeError('unknown mission param %s' % k)
@@ -75,14 +80,23 @@ class MissionParams(object):
 
 
 class MissionLogic(object):
-    def __init__(self, params, arena, lanes_route_arena, ring_builder, gates_arena, clear_fn=None):
+    def __init__(self, params, arena, lanes_route_arena, ring_builder, gates_arena, clear_fn=None,
+                 exit_lap_builder=None):
         """lanes_route_arena: list of arena points. ring_builder(entry_xy, heading) -> arena points.
         gates_arena: dict colour -> (x, y) default exit positions (arena frame)."""
         self.p = params
         self.arena = arena
         self.lanes_odom = [arena.to_odom(x, y) for x, y in lanes_route_arena]
         self.ring_builder = ring_builder
+        self.exit_lap_builder = exit_lap_builder or ring_builder   # the lap to leave along
         self.gates_arena = dict(gates_arena)
+        # the exit is one of the OTHER three corners (scoring sheet 4.3): drop the start zone's gate
+        sx, sy = arena.start.x, arena.start.y
+        near = min(self.gates_arena.items(), key=lambda kv: math.hypot(kv[1][0] - sx, kv[1][1] - sy)) \
+            if self.gates_arena else None
+        self.start_gate = near[0] if near and math.hypot(near[1][0] - sx, near[1][1] - sy) < 1.5 else None
+        if self.start_gate:
+            self.gates_arena.pop(self.start_gate)
         # clear_fn(x, y, radius, ignore_xy) -> bool, from the live grid: avoids sending the car into
         # clutter it can't turn its way out of (no reverse). None = assume clear.
         self.clear_fn = clear_fn
@@ -124,8 +138,7 @@ class MissionLogic(object):
         """Keep a goal inside the arena (geofence: the boundary may be unmarked)."""
         ax, ay = self.arena.to_arena(ox, oy)
         m = self.p.geofence_margin
-        ax = min(max(ax, m), self.arena.size - m)
-        ay = min(max(ay, m), self.arena.size - m)
+        ax, ay = self.arena.clamp(ax, ay, m)
         return self.arena.to_odom(ax, ay)
 
     # ------------------------------------------------------------------------------------
@@ -187,6 +200,8 @@ class MissionLogic(object):
         if self.state in (LANES, RING):
             if p.route_inspect == 'always':
                 started = self._maybe_start_inspect(now, pose, candidates)
+            elif p.route_inspect == 'none':
+                started = False          # small arena: read from the route, revisit in MOPUP
             else:
                 started = self._maybe_start_inspect(now, pose, candidates, cheap_only=True)
             if started:
@@ -214,11 +229,11 @@ class MissionLogic(object):
                 self._start_exit(now, pose, exit_info, mats, reason=self._shortcut_reason())
                 return self.route
             # 1. cards seen but not read, nearest first, from a direction not tried yet
-            if self._maybe_start_inspect(now, pose, candidates, max_dist=float('inf'), kinds=('unread',)):
+            if p.mopup_visits and self._maybe_start_inspect(now, pose, candidates, max_dist=float('inf'), kinds=('unread',)):
                 return self.route
             # 2. one more look at low-confidence cards (and SAFE cards with an unsure star), lowest first
-            if self._maybe_start_inspect(now, pose, candidates, max_dist=float('inf'), kinds=('recheck',),
-                                         order='conf'):
+            if p.mopup_visits and self._maybe_start_inspect(now, pose, candidates, max_dist=float('inf'),
+                                                            kinds=('recheck',), order='conf'):
                 return self.route
             # 3. cards still missing: another lap while there's time
             if p.expected_cards and n_conf < p.expected_cards and self.elapsed(now) < p.ring_end - 90.0:
@@ -236,7 +251,7 @@ class MissionLogic(object):
         if self.state == EXIT:
             # refresh the gate if a better estimate arrived (colour decided, or the mat seen again:
             # a fresh sighting removes the odometry drift accumulated since it was first seen)
-            allowed = sorted((exit_info or {}).get('allowed') or [])
+            allowed = sorted(c for c in ((exit_info or {}).get('allowed') or []) if c != self.start_gate)
             if self.exit_colour is None or (exit_info and exit_info.get('colour')
                                             and exit_info['colour'] != self.exit_colour
                                             and not allowed) or \
@@ -268,7 +283,7 @@ class MissionLogic(object):
             if not last and d < p.wp_pass_window:
                 nx, ny = self.route[self.idx + 1]
                 passed = (pose.x - wx) * (nx - wx) + (pose.y - wy) * (ny - wy) > 0
-            if not last and not passed and d < 2.2 * p.turn_radius:
+            if not last and not passed and p.skip_unreachable and d < 2.2 * p.turn_radius:
                 passed = inside_turn_circle(pose, wx, wy, p.turn_radius)
             if d < tol or passed:
                 self.idx += 1
@@ -278,11 +293,31 @@ class MissionLogic(object):
             if self.best_d is None or d < self.best_d - 0.3:
                 self.best_d, self.best_d_time = d, now
             elif now - self.best_d_time > p.wp_block_time and not last:
+                if p.turn_back_on_block and self.state == EXIT and \
+                        now - getattr(self, '_turned_back', -1e9) > 3 * p.wp_block_time:
+                    # the way to the exit is blocked (cards across a corridor): go round the other way
+                    # (only when leaving: in the search, turning round costs more than it finds)
+                    self._turned_back = now
+                    self.log(now, 'waypoint %d blocked for %.0f s: turning back, lap the other way'
+                             % (self.idx, p.wp_block_time))
+                    self._turn_back(now, pose)
+                    return
                 self.log(now, 'waypoint %d blocked for %.0f s, skipping' % (self.idx, p.wp_block_time))
                 self.idx += 1
                 self.best_d = None
                 continue
             break
+
+    def _turn_back(self, now, pose):
+        back = Pose2D(pose.x, pose.y, wrap(pose.yaw + math.pi))
+        if self.state == EXIT:
+            self._choose_gate(now, back, self._last_exit_info, self._last_mats, quiet=True, force=True)
+            return
+        ax, ay = self.arena.to_arena(pose.x, pose.y)
+        lap = self.ring_builder((ax, ay), self.arena.yaw_to_arena(back.yaw))
+        self.route = [self.arena.to_odom(x, y) for x, y in lap]
+        self.idx = 0
+        self.best_d = None
 
     def _start_ring(self, now, pose, reason):
         ax, ay = self.arena.to_arena(pose.x, pose.y)
@@ -467,7 +502,7 @@ class MissionLogic(object):
     def _shortcut_ok(self, exit_info, mats, targets, candidates=()):
         if not exit_info:
             return False
-        allowed = [c for c in (exit_info.get('allowed') or []) if c in mats or c in self.gates_arena]
+        allowed = [c for c in (exit_info.get('allowed') or []) if c in self.gates_arena]
         colour = exit_info.get('colour')
         if not allowed and not (colour and (colour in mats or colour in self.gates_arena)):
             return False
@@ -487,15 +522,22 @@ class MissionLogic(object):
 
     def _gate_xy(self, colour, mats):
         if colour in mats:
-            return mats[colour], 'mat seen'
+            mx, my = mats[colour]
+            ref = self.gates_arena.get(colour)
+            # a mat sighting corrects drift, but a sighting far from where the zone must be (corner
+            # zones of a walled arena are known exactly) is a misread: ignore it
+            if ref is None or self.p.mat_max_offset <= 0 or math.hypot(
+                    *(a - b for a, b in zip(self.arena.to_odom(*ref), (mx, my)))) <= self.p.mat_max_offset:
+                return (mx, my), 'mat seen'
         if colour in self.gates_arena:
             return self.arena.to_odom(*self.gates_arena[colour]), 'mapped position'
         return None, ''
 
-    def _choose_gate(self, now, pose, exit_info, mats, quiet=False):
+    def _choose_gate(self, now, pose, exit_info, mats, quiet=False, force=False):
+        self._last_exit_info, self._last_mats = exit_info, mats
         colour = None
         how = ''
-        allowed = sorted((exit_info or {}).get('allowed') or [])
+        allowed = sorted(c for c in ((exit_info or {}).get('allowed') or []) if c != self.start_gate)
         self.exit_allowed = allowed
         options = []
         for c in allowed:
@@ -520,6 +562,11 @@ class MissionLogic(object):
         elif colour is not None and colour in self.gates_arena:
             gx, gy = self.arena.to_odom(*self.gates_arena[colour])
             how += ', configured position'
+        elif self.exit_colour in self.gates_arena:
+            # no colour known and a gate already picked: keep it (don't flip as the car moves)
+            colour = self.exit_colour
+            gx, gy = self._gate_xy(colour, mats)[0]
+            how = 'NO COLOUR KNOWN, keeping the gate picked before'
         else:
             # no colour at all: nearest gate, so we at least leave the arena
             best = None
@@ -536,13 +583,74 @@ class MissionLogic(object):
         n = math.hypot(dx, dy) or 1.0
         approach = (gx + self.p.exit_approach_dist * dx / n, gy + self.p.exit_approach_dist * dy / n)
         changed = self.exit_colour is not None and colour != self.exit_colour
+        if quiet and not force and not changed and self.route and len(self.route) >= 2 and getattr(self, '_exit_run', None):
+            # the same gate, a better position estimate: move the end of the route, keep the rest
+            # (rebuilding the lap here would send the car round again)
+            ddx, ddy, run_in = self._exit_run
+            bx, by = self.arena.to_arena(gx, gy)
+            self.route[-2:] = [self.arena.to_odom(bx - run_in * ddx, by - run_in * ddy), (gx, gy)]
+            self.exit_target = (gx, gy)
+            return
         self.exit_colour = colour
         self.exit_target = (gx, gy)
-        self.route = [approach, (gx, gy)]
+        self._exit_run = None
+        lead = []
+        lap = None
+        if self.p.exit_via_route:
+            # a fresh lap from where the car is now (this runs again when the gate estimate moves)
+            ax, ay = self.arena.to_arena(pose.x, pose.y)
+            lap = [self.arena.to_odom(x, y) for x, y in
+                   self.exit_lap_builder((ax, ay), self.arena.yaw_to_arena(pose.yaw))]
+        # the diagonal approach (towards the arena centre), kept for refreshes of the gate estimate
+        bx, by = self.arena.to_arena(gx, gy)
+        cx2, cy2 = self.arena.centre
+        dd = math.hypot(bx - cx2, by - cy2) or 1.0
+        self._exit_run = ((bx - cx2) / dd, (by - cy2) / dd, self.p.exit_approach_dist)
+        if lap:
+            turn_off = self._wall_approach(lap, gx, gy)
+            if turn_off is not None:
+                # drive the lap until it runs along a wall towards the zone, ease over to the zone's
+                # centre line and drive straight in along the wall (no tight turn in the corner)
+                j, approach, self._exit_run = turn_off
+                lead = lap[:j + 1]
+            else:
+                # stay on the lap until the point nearest the diagonal approach, then turn in
+                j = min(range(len(lap)), key=lambda i: math.hypot(lap[i][0] - approach[0],
+                                                                  lap[i][1] - approach[1]))
+                lead = lap[:j + 1]
+                if lead and math.hypot(lead[-1][0] - approach[0], lead[-1][1] - approach[1]) < 0.8:
+                    lead = lead[:-1]
+        self.route = lead + [approach, (gx, gy)]
         self.idx = 0
         self.best_d = None
         if not quiet:
             self.log(now, '%s exit gate: %s (%s)' % ('changed' if changed else 'chose', colour, how))
+
+    def _wall_approach(self, lap, gx, gy, run_in=2.2, min_lead=2.4, max_lead=5.0, max_side=1.6):
+        """Where to leave the lap for a corner zone at (gx, gy) (odom): the first lap point heading
+        along one of the zone's walls towards it, min_lead..max_lead metres before the approach point
+        (run_in metres before the gate on the zone's centre line) and at most max_side to the side.
+        Returns (lap index, approach point) or None."""
+        bx, by = self.arena.to_arena(gx, gy)
+        dirs = [(1.0 if bx > self.arena.size_x / 2 else -1.0, 0.0),
+                (0.0, 1.0 if by > self.arena.size_y / 2 else -1.0)]   # arena-frame directions INTO the corner
+        best = None
+        for dx, dy in dirs:
+            ax_, ay_ = bx - run_in * dx, by - run_in * dy
+            ap = self.arena.to_odom(ax_, ay_)
+            for i in range(len(lap) - 1):
+                px, py = self.arena.to_arena(*lap[i])
+                qx, qy = self.arena.to_arena(*lap[i + 1])
+                h = math.atan2(qy - py, qx - px)
+                if math.cos(h - math.atan2(dy, dx)) < 0.85:
+                    continue
+                along = (ax_ - px) * dx + (ay_ - py) * dy
+                side = abs(-(ax_ - px) * dy + (ay_ - py) * dx)
+                if min_lead <= along <= max_lead and side <= max_side:
+                    if best is None or i < best[0]:
+                        best = (i, ap, (dx, dy, run_in))
+                    break
+        return best
 
     def _at_gate(self, pose, now=0.0):
         """Exited when near the gate centre; or inside the zone and no longer getting closer
@@ -567,6 +675,7 @@ class MissionLogic(object):
         if self.state in (EXIT, DONE):
             return
         self.log(now, 'start EXIT (%s)' % reason)
+
         self.log(now, '%s -> %s' % (self.state, EXIT))
         self.state = EXIT
         self.exit_colour = None

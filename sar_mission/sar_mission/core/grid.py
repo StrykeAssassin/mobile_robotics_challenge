@@ -107,6 +107,13 @@ class LiveGrid(object):
     def occupied(self):
         return self.L > self.occ_threshold
 
+    def occupancy(self):
+        """OccupancyGrid-style int8 data (rows = y up): -1 unknown, 0 free, 100 occupied."""
+        out = np.full(self.L.shape, -1, dtype=np.int8)
+        out[self.L < -0.05] = 0
+        out[self.L > self.occ_threshold] = 100
+        return out
+
     def mark_disc(self, x, y, radius):
         """Force-mark an obstacle (e.g. a detector 'box' hint the depth slice can't see)."""
         r0, c0 = self.to_cell(x, y)

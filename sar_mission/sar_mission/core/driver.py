@@ -40,6 +40,7 @@ class DriverParams(object):
         self.arc_step = 0.1
         self.clearance = 0.36             # car half-width (~0.16) + margin
         self.min_free = 0.6               # below this on every arc: stop
+        self.final_approach = 1.6        # this close to the path's end, only the rest must be clear
         self.min_need = 1.2               # never move unless an arc is clear this far, even for a near
                                           # goal: stops the car creeping into pockets it can't turn out of
         self.escape_after = 3.0           # blocked this long -> try arcs with escape_clearance
@@ -57,6 +58,8 @@ class DriverParams(object):
         self.reverse_time = 1.5
         self.stuck_time = 3.0
         self.stuck_speed = 0.05
+        self.rear_offset = 0.45           # pose (camera, ~0.2 m ahead of the axle) to the rear bumper
+        self.rear_need = 0.35             # reverse only along an arc clear this far behind the car
         for k, v in kw.items():
             if not hasattr(self, k):
                 raise AttributeError('unknown driver param %s' % k)
@@ -201,7 +204,37 @@ class DriverLogic(object):
             out[u] = worst
         return out
 
+    def rear_free(self, pose, u, horizon=1.0, clearance=0.25):
+        """How far the car can REVERSE with steer u before its rear comes within `clearance` of an
+        obstacle point it remembers (the camera faces forward: behind the car there are only the
+        remembered scans and the fence)."""
+        obs = self._obstacles_robot_frame(pose)
+        if len(obs) == 0:
+            return horizon
+        worst = horizon
+        for k in self.curvatures(u):
+            pts, s = arc_points_k(k, horizon, self.p.arc_step)
+            # driving backwards along the same circle: mirror x, then the rear bumper is behind
+            back = np.stack([-pts[:, 0] - self.p.rear_offset, pts[:, 1]], axis=1)
+            d2 = ((back[:, None, :] - obs[None, :, :]) ** 2).sum(axis=2).min(axis=1)
+            here = float(np.sqrt(((obs - np.array([-self.p.rear_offset, 0.0])) ** 2).sum(axis=1)).min())
+            hit = np.nonzero((d2 < clearance ** 2) & (np.sqrt(d2) < here + 0.02))[0]
+            if hit.size:
+                worst = min(worst, float(s[hit[0]] - self.p.arc_step))
+        return max(worst, 0.0)
+
+    def _pick_reverse(self, pose, prefer):
+        """Reverse steer with the most room behind (prefer `prefer` on ties), or None if no room."""
+        opts = sorted(set([-1.0, 0.0, 1.0]) & set(self.p.steer_options) or self.p.steer_options,
+                      key=lambda u: (abs(u - prefer)))
+        room = dict((u, self.rear_free(pose, u)) for u in opts)
+        best = max(room.values())
+        if best < self.p.rear_need:
+            return None
+        return min([u for u in opts if room[u] >= best - 0.1], key=lambda u: abs(u - prefer))
+
     def _lookahead_point(self, pose):
+
         path = self.path
         best_i, best_d = self.idx, float('inf')
         for i in range(self.idx, min(len(path), self.idx + 40)):
@@ -232,9 +265,13 @@ class DriverLogic(object):
             return DriverOutput(0.0, 0, 'reached', front)
 
         if self.reverse_until is not None:
-            if now < self.reverse_until:
+            rear_ok = self.rear_free(pose, -self.reverse_side, horizon=0.4) >= 0.2
+            moving = self.slow_since is None or now - self.slow_since < 1.0
+            if now < self.reverse_until and rear_ok and moving:
                 return self._stuck_check(now, DriverOutput(-self.reverse_side, -1, 'reversing', front), speed_est)
             self.reverse_until = None
+            if not (rear_ok and moving):
+                self.no_reverse_until = now + 4.0      # wall behind: escape forwards for a while
 
         lx, ly = self._lookahead_point(pose)
         alpha = wrap(math.atan2(ly - pose.y, lx - pose.x) - pose.yaw)
@@ -242,6 +279,10 @@ class DriverLogic(object):
 
         free = self.free_distances(pose)
         need = min(p.horizon, max(dist_goal + 0.4, p.min_need))
+        if dist_goal < p.final_approach:
+            # the last metre or two to the goal (an exit zone in a corner, a viewpoint near a wall):
+            # only that much must be clear, or the walls round the goal would keep the car out
+            need = max(dist_goal + 0.15, p.min_free)
         ok = [u for u in p.steer_options if free[u] >= need - 1e-6]
 
         def cost(u):
@@ -271,7 +312,13 @@ class DriverLogic(object):
                         self.last_choice = choice
                         return self._stuck_check(now, DriverOutput(choice, 1, 'escaping', front, tight),
                                                  speed_est)
-                if not p.reverse_allowed and now - self.blocked_since > p.last_resort_after:
+                can_reverse = p.reverse_allowed and now >= getattr(self, 'no_reverse_until', -1e9)
+                rev = None
+                if can_reverse:
+                    want = choice if choice != 0 else (1.0 if u_des >= 0 else -1.0)
+                    rev = self._pick_reverse(pose, -want)
+                if rev is None and now - self.blocked_since > (p.last_resort_after if not p.reverse_allowed
+                                                                else p.escape_after):
                     if self.burst_until is None:
                         u_best, gain = self.escape_direction(pose)
                         if u_best is not None and gain > 0.05:
@@ -283,10 +330,11 @@ class DriverLogic(object):
                         # burst over: stop, look again, and allow another burst after a short wait
                         self.burst_until = None
                         self.blocked_since = now - p.last_resort_after + 2.0
-                if p.reverse_allowed:
+                if rev is not None:
                     self.reverse_until = now + p.reverse_time
-                    self.reverse_side = choice if choice != 0 else (1.0 if u_des >= 0 else -1.0)
-                    return self._stuck_check(now, DriverOutput(-self.reverse_side, -1, 'reversing', front, free),
+                    self.reverse_side = -rev
+                    self.slow_since = None
+                    return self._stuck_check(now, DriverOutput(rev, -1, 'reversing', front, free),
                                              speed_est)
                 self.slow_since = None
                 return DriverOutput(0.0, 0, 'blocked', front, free)
@@ -316,13 +364,56 @@ class DriverLogic(object):
         self.last_choice = -self.last_choice
 
 
-def fence_points(arena, margin=0.6, step=0.25):
-    """Arena boundary moved `margin` inwards, sampled every `step` m, in the ODOM frame."""
-    s = arena.size
-    lo, hi = margin, s - margin
+def zone_fence(arena, corners, step=0.2):
+    """Keep-out lines along the inner edges of the given corner zones (arena frame -> odom).
+    The run ends when the whole car is inside a zone the car 'treats as the exit', so the car must
+    not wander into a zone while searching; the exit zone is opened when the car leaves."""
+    z = getattr(arena, 'zone', 1.5)
     pts = []
-    n = int((hi - lo) / step) + 1
-    for i in range(n):
-        t = lo + i * step
-        pts += [(t, lo), (t, hi), (lo, t), (hi, t)]
+    n = int(z / step) + 1
+    for c in corners:
+        cx, cy = arena.corner_xy(c, inset=0.0)
+        ex = z if cx < arena.size_x / 2 else -z        # inner edge offsets from the corner
+        ey = z if cy < arena.size_y / 2 else -z
+        for i in range(n + 1):
+            t = min(i * step, z)
+            pts.append((cx + ex, cy + (t if ey > 0 else -t)))
+            pts.append((cx + (t if ex > 0 else -t), cy + ey))
     return [arena.to_odom(x, y) for x, y in pts]
+
+
+def start_corner_of(arena):
+    sx, sy = arena.start.x, arena.start.y
+    return ('S' if sy < arena.size_y / 2 else 'N') + ('W' if sx < arena.size_x / 2 else 'E')
+
+
+def fence_points(arena, margin=0.6, step=0.25, zones=None):
+    """Arena boundary moved `margin` inwards, sampled every `step` m, in the ODOM frame.
+    zones: corner names ('SW', ...) to fence off as well (see zone_fence)."""
+    xl, xh = margin, arena.size_x - margin
+    yl, yh = margin, arena.size_y - margin
+    pts = []
+    for i in range(int((xh - xl) / step) + 1):
+        t = xl + i * step
+        pts += [(t, yl), (t, yh)]
+    for i in range(int((yh - yl) / step) + 1):
+        t = yl + i * step
+        pts += [(xl, t), (xh, t)]
+    out = [arena.to_odom(x, y) for x, y in pts]
+    if zones:
+        out += zone_fence(arena, zones)
+    return out
+
+
+def mission_fence(arena, margin=0.0, keep_out_zones=True, exit_xy_odom=None):
+    """The driver's fence for the challenge: the walls, plus keep-out lines round the corner zones
+    except the start zone (the car starts in it) and, once leaving, the chosen exit zone."""
+    zones = []
+    if keep_out_zones:
+        start = start_corner_of(arena)
+        zones = [c for c in ('SW', 'SE', 'NE', 'NW') if c != start]
+        if exit_xy_odom is not None:
+            ax, ay = arena.to_arena(*exit_xy_odom)
+            ex = min(zones, key=lambda c: math.hypot(arena.corner_xy(c)[0] - ax, arena.corner_xy(c)[1] - ay))
+            zones.remove(ex)
+    return fence_points(arena, margin, zones=zones)

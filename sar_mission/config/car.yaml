@@ -4,13 +4,15 @@
 
 /**:
   ros__parameters:
-    # ---- arena (arena frame: origin SW corner, x east, y north) ----
-    arena_size: 20.0
-    search_min: 5.0
-    search_max: 15.0
+    # ---- arena (scoring sheet 27 Nov: ~10 x 7 m, walls, 1.5 x 1.5 m corner zones) ----
+    # arena frame: origin SW corner, x east along the 10 m wall, y north. If the court is the other
+    # way round on the day, keep x along the LONG wall and pick the start corner to match.
+    arena_size: [10.0, 7.0]     # MEASURE on the day (x = long side)
+    zone_size: 1.5
     start_corner: "SW"          # SW / SE / NE / NW: set per run (start_corner:=... on the launch line)
-    start_heading: "edge"       # car squared to the arena edge with the jig; or "diagonal", or degrees
-    start_inset: 1.5            # car at the centre of the 3 x 3 m start zone
+    start_heading: "edge"       # along the long wall, into the arena; or "diagonal", or degrees (the
+                                # judges give the heading: TA question)
+    start_inset: 0.75           # car at the centre of the 1.5 x 1.5 m start zone
     # ---- topics / frames ----
     odom_frame: "odom"          # known-map mode: car.launch.py switches these to sar_map, /sar/odom
     odom_topic: "/zed/zed_node/odom"
@@ -35,7 +37,7 @@ depth_scan:
 
 path_planner:
   ros__parameters:
-    inflation: 0.4              # car half-width + margin
+    inflation: 0.3              # car half-width + margin (0.4 in the 20 m arena)
     replan_period: 1.0
     sensor_offset: 0.2          # fallback if TF odom -> scan frame is missing
 
@@ -48,14 +50,19 @@ local_driver:
     turn_radius_right: 0.0
     radius_spread: 0.25            # wonky car: arcs must be clear for radii 25% tighter or wider
     steer_hold: 0.5                # s between steering changes
-    reverse_allowed: false         # MEASURE: set true if a negative linear.x reverses the car
+    reverse_allowed: true          # the car reverses (checked): needed in the small arena
     slow_linear: 0.3               # 0.1 < x <= 0.6 = slow (W3 manual)
     lock_angular: 0.15             # inside the manual's left/right bands (+-0.2 is NOT left)
     allow_fast: false
-    clearance: 0.36
+    clearance: 0.30
+    goal_tolerance: 0.2            # the exit zone is only 1.5 m: drive right to its centre
+    escape_clearance: 0.2          # boxed in: arcs this close to things are allowed to get out
     lookahead: 1.2
     use_fence: true
-    fence_margin: 0.6
+    fence_margin: 0.0              # the walls themselves (the camera sees them too)
+    zone_keep_out: true            # never drive into another corner zone while searching (a car fully
+                                   # inside a zone it treats as the exit ends the run)
+    horizon: 2.2                   # small arena: arcs checked 2.2 m ahead (3.0 in the 20 m arena)
     watchdog: 0.5
 
 localizer:
@@ -83,18 +90,31 @@ mission_manager:
     exit_rule: "stars"          # "stars": nearest exit matching a star on a SAFE card; "sign": old rule
     route_clearance: 0.8        # known-map mode: route points kept this far from mapped obstacles
     max_gap_viewpoints: 6
-    n_lanes: 3                  # 4 only if turn_radius <= 1.25 m
-    ring_inset: 3.0
-    gate_layout: "corners"      # TA question: "corners" (3 x 3 m zones) or "midpoints" (one mat per side)
-    gate_colours: ["red", "blue", "green", "yellow"]   # in order SW, SE, NE, NW (or S, E, N, W)
-    start_on: "motion"          # clock starts when the car first moves (after pressing O on the remote)
-    lanes_end: 600.0
-    ring_end: 900.0
-    forced_exit: 1020.0
-    estop: 1170.0
+    route_mode: "auto"          # auto: laps in the 10 x 7 m arena ("loops"), lanes + ring in a big one
+    lap_pattern: ["ring", "figure8"]   # laps after the first ring: they alternate the viewing directions
+    ring_inset: 1.5             # the ring runs 1.5 m from the walls; its ends are 2 m radius half circles
+    ring_corner: 2.0
+    figure8_radius: 2.0
+    n_lanes: 3                  # big arena only
+    gate_layout: "corners"      # the four 1.5 x 1.5 m corner zones
+    gate_colours: ["red", "blue", "green", "yellow"]   # MEASURE: zone colours in order SW, SE, NE, NW
+    start_on: "motion"          # clock starts when the car first moves (scoring sheet 3.1)
+    # timers, seconds from the first move (Tmax = 600 s; full time points up to 300 s)
+    lanes_end: 120.0            # first lap
+    ring_end: 450.0             # search ends (7:30) unless all 12 cards are in earlier
+    forced_exit: 500.0          # leave whatever is happening
+    estop: 590.0                # stop the car (it must be in the exit zone by 600 s)
+    exit_via_route: true        # leave along the ring and drive into the zone along its wall
+    exit_approach_dist: 2.0
+    gate_tolerance: 0.3         # "in the zone": within 0.3 m of its centre (the whole car must be inside)
+    gate_half_size: 0.45
+    mat_max_offset: 0.5         # ignore a floor-colour sighting this far from the zone's known corner
+    geofence_margin: 0.6
+    mopup_visits: true          # after the laps: drive to cards seen but not read
+    turn_back_on_block: true    # leaving: the way to the exit blocked for wp_block_time -> go round the other way
     expected_cards: 12          # cards on the course: leave early only when all are confirmed (0 = unknown)
     good_conf: 0.8              # confirmed cards below this get one more look, if time allows
-    route_inspect: "cheap"      # stop for a card on the route only if lined up / close ahead ("always" = old)
+    route_inspect: "none"       # small arena: read cards from the laps, no stops ("cheap" / "always" = big arena)
     cheap_dist: 3.0
     revisit_dwell: 3.0          # seconds of looking at a revisit before creeping closer
     creep: 0.5                  # the one fine correction: this much closer (m)
@@ -107,7 +127,18 @@ target_tracker:
     depth_topic: "/zed/zed_node/depth/depth_registered"
     camera_info_topic: "/zed/zed_node/depth/camera_info"
     use_zed_objects: false      # true = ZED person detection as a backup position source
-    csv_path: "~/sar_targets.csv"
+    csv_path: "~/sar_run/tracks.csv"      # every track, for debugging
+    # ---- what the judges read (scoring sheet 3.4 and 3.6) ----
+    answer_file: "~/sar_run/answer.csv"   # x,y,class - at most 12 lines, best first, cleared at start
+    answer_header: true
+    answer_frame: "start"       # TA question: "start" = origin where the car starts, x = its heading;
+                                # "zone" = the start zone's outer corner, axes along the walls;
+                                # "arena" = SW corner; "custom" = answer_origin [x, y, yaw_deg] (arena frame)
+    answer_origin: [0.0, 0.0, 0.0]
+    run_dir: "~/sar_run"        # semantic map for the mapping bonus: map.pgm/.yaml, map_targets.json,
+                                # map_semantic.png, saved every map_period s and at the end
+    map_period: 10.0
+    map_topic: "/sar/grid"      # the grid built during the run ("/map" if RTAB-Map runs during the run)
     accept_conf: 0.7            # a card counts as confirmed from here (and >= min_class_obs readings)
     min_class_obs: 3
     expected_cards: 12          # same as mission_manager: duplicates are merged above this count
