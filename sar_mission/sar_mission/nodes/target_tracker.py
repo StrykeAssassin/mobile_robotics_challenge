@@ -39,6 +39,9 @@ class TargetTrackerNode(Node):
             accept_conf=float(U.param(self, 'accept_conf', 0.7)),
             min_class_obs=int(U.param(self, 'min_class_obs', 3)),
             view_distance=float(U.param(self, 'view_distance', 1.5)))
+        self.expected_cards = int(U.param(self, 'expected_cards', 12))
+        self.good_conf = float(U.param(self, 'good_conf', 0.8))
+        self.recheck = bool(U.param(self, 'recheck', True))
         self.min_board_px = int(U.param(self, 'min_board_px', 18))
         self.csv_path = os.path.expanduser(U.param(self, 'csv_path', '~/sar_targets.csv'))
         self.depth = None
@@ -64,7 +67,7 @@ class TargetTrackerNode(Node):
         self.pub = self.create_publisher(String, '/sar/targets', U.RELIABLE_QOS)
         self.marker_pub = self.create_publisher(MarkerArray, '/sar/target_markers', U.RELIABLE_QOS)
         self.create_timer(0.5, self.publish)
-        self.create_timer(2.0, self.tracker.merge_close)
+        self.create_timer(2.0, self.merge)
         self.create_timer(1.0, self.write_csv)
         self.get_logger().info('target_tracker ready, writing %s' % self.csv_path)
 
@@ -82,13 +85,12 @@ class TargetTrackerNode(Node):
 
     def on_feedback(self, msg):
         fb = U.json_from(msg)
-        if not fb:
-            return
-        t = self.tracker.get(fb.get('id'))
-        if t is not None:
-            t.inspect_attempts += 1
-            if fb.get('result') == 'classified' or t.inspect_attempts >= self.tracker.max_inspect_attempts:
-                t.inspected = True
+        if fb:
+            self.tracker.apply_feedback(fb, self.tracker.max_inspect_attempts)
+
+    def merge(self):
+        self.tracker.merge_close()
+        self.tracker.enforce_count(self.expected_cards)     # never more cards than the course has
 
     def _setup_zed_objects(self):
         try:
@@ -173,17 +175,13 @@ class TargetTrackerNode(Node):
 
     # ---- outputs -------------------------------------------------------------------------------
     def publish(self):
-        cands = []
-        for t in self.tracker.inspect_candidates():
-            if t.best()[0] == 'NOT_TARGET':
-                continue
-            robot = (self.pose.x, self.pose.y) if self.pose is not None else None
-            _, n = self.tracker.viewpoint(t, robot)
-            cands.append({'id': t.id, 'x': float(t.xy[0]), 'y': float(t.xy[1]),
-                          'nx': float(n[0]), 'ny': float(n[1])})
+        # unread cards and (once each) low-confidence ones, each with the direction to look from
+        cands = self.tracker.mission_candidates(self.good_conf, self.recheck)
         rows = self.tracker.summary(self.arena.to_arena)
         self.pub.publish(U.json_msg({'targets': rows, 'candidates': cands,
-                                     'allowed_exits': self.tracker.allowed_exits()}))
+                                     'allowed_exits': self.tracker.allowed_exits(),
+                                     'confirmed': self.tracker.n_confirmed(),
+                                     'expected': self.expected_cards}))
         self.publish_markers()
 
     def publish_markers(self):
@@ -225,11 +223,12 @@ class TargetTrackerNode(Node):
         try:
             with open(tmp, 'w') as f:
                 w = csv.writer(f)
-                w.writerow(['id', 'class', 'confidence', 'confirmed', 'arena_x_m', 'arena_y_m', 'star',
-                            'first_seen_s', 'n_observations', 'written_at'])
+                w.writerow(['id', 'class', 'confidence', 'reading_quality', 'confirmed', 'rechecked', 'arena_x_m',
+                            'arena_y_m', 'star', 'first_seen_s', 'n_observations', 'written_at'])
                 for r in rows:
-                    w.writerow([r['id'], r['class'], r['confidence'], r['confirmed'], r['x'], r['y'],
-                                r.get('star') or '', r['first_seen'], r['n_obs'], time.strftime('%H:%M:%S')])
+                    w.writerow([r['id'], r['class'], r['confidence'], r.get('quality', ''), r['confirmed'],
+                                r.get('rechecked', False), r['x'], r['y'], r.get('star') or '', r['first_seen'],
+                                r['n_obs'], time.strftime('%H:%M:%S')])
             os.replace(tmp, self.csv_path)
         except OSError as e:
             self.get_logger().warn('could not write %s: %s' % (self.csv_path, e), throttle_duration_sec=30.0)

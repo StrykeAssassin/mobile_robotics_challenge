@@ -139,7 +139,7 @@ def seg_dist(p, a, b):
 
 def run(seed, args, verbose=False):
     rng = np.random.RandomState(1000 + seed)
-    lay_map = L.generate(seed=seed, gate_layout=args.gates)       # the course as it was mapped
+    lay_map = L.generate(seed=seed, gate_layout=args.gates, n_boards=args.boards)   # the course as mapped
     lay = L.rebuilt(lay_map, args.shift, seed=seed) if args.shift > 0 else lay_map   # as it is today
     world = SimWorld(lay, rng)
     start = start_pose_from_corner(args.corner, lay['arena'], 1.5, 'edge')
@@ -158,7 +158,11 @@ def run(seed, args, verbose=False):
         lanes = W.lanes(arena, start, n_lanes=args.lanes)
         ring_builder = lambda xy, hd: W.ring(arena, xy, hd, inset=3.0, mid_pull=args.mid_pull)
     gates_cfg = W.default_gates(arena, args.gates)
-    mp = MissionParams(lanes_end=600, ring_end=900, forced_exit=1020, estop=1170)
+    if args.mission == 'new':
+        mp = MissionParams(lanes_end=600, ring_end=900, forced_exit=1020, estop=1170, expected_cards=args.boards)
+    else:     # the mission before the 12-card changes: stops for every card, leaves after 4 classes
+        mp = MissionParams(lanes_end=600, ring_end=900, forced_exit=1020, estop=1170, expected_cards=0,
+                           route_inspect='always', creep=0.0, revisit_dwell=6.0)
     clear_fn = lambda x, y, r, ign: grid.clear(x, y, r, ign, 0.45)
     mission = MissionLogic(mp, arena, lanes, ring_builder, gates_cfg, clear_fn=clear_fn)
     planner = RoutePlanner(grid, coarse_factor=2, inflation=0.4)
@@ -244,14 +248,42 @@ def run(seed, args, verbose=False):
                 normal = (math.cos(nyaw), math.sin(nyaw))
                 probs = None
                 star = None
-                if d <= args.classify_range and not back:
-                    lab = b['cls'] if rng.rand() > args.confusion else CONFUSABLE[b['cls']]
-                    probs = probs_from_label(lab, 0.75)
-                    if lab == 'SAFE':
-                        star = b.get('star', 'none') if rng.rand() < 0.9 else \
-                            ['red', 'blue', 'green', 'yellow', 'none'][rng.randint(5)]
+                read_back = False
+                if args.perception == 'old':
+                    if d <= args.classify_range and not back:
+                        lab = b['cls'] if rng.rand() > args.confusion else CONFUSABLE[b['cls']]
+                        probs = probs_from_label(lab, 0.75)
+                        if lab == 'SAFE':
+                            star = b.get('star', 'none') if rng.rand() < 0.9 else \
+                                ['red', 'blue', 'green', 'yellow', 'none'][rng.randint(5)]
+                    read_back = back and d <= args.classify_range
+                else:
+                    # card recognizer (tools/card_bench): readable from ~55 px (about 5 m), better
+                    # closer and face-on; ~1-2% wrong class; runs at ~2 Hz, not every sim tick
+                    h_px = 700.0 * L.BOARD_H / max(d, 0.3)
+                    off = abs(abs(view) - (math.pi if back else 0.0))      # angle off the card's face
+                    p_read = 0.85 if h_px >= 100 else 0.80 if h_px >= 70 else 0.72 if h_px >= 55 else 0.0
+                    p_read *= 1.0 if off < math.radians(45) else 0.6 if off < math.radians(62) else 0.0
+                    if rng.rand() < 0.4 and rng.rand() < p_read:
+                        if back:
+                            read_back = True
+                        else:
+                            wrong = rng.rand() < args.recog_wrong
+                            lab = CONFUSABLE[b['cls']] if wrong else b['cls']
+                            # per-reading confidence as the recognizer reports it (temperature 9,
+                            # measured on tools/card_bench): mostly 0.85-0.97, about 1 in 7 lower
+                            if wrong:
+                                conf = rng.uniform(0.55, 0.85)
+                            elif rng.rand() < (0.86 if h_px >= 70 else 0.8):
+                                conf = rng.uniform(0.85, 0.97)
+                            else:
+                                conf = rng.uniform(0.6, 0.85)
+                            probs = probs_from_label(lab, conf)
+                            if lab == 'SAFE':
+                                star = b.get('star', 'none') if rng.rand() < 0.9 else \
+                                    ['red', 'blue', 'green', 'yellow', 'none'][rng.randint(5)]
                 tracker.add(t, (ox, oy), (cam_odom.x, cam_odom.y), probs=probs, normal=normal,
-                            is_back=back and d <= args.classify_range, star=star)
+                            is_back=read_back, star=star)
             for b in lay['boards']:
                 if b['cls'] != 'SAFE' or b.get('star') in (None, 'none'):
                     continue
@@ -277,23 +309,24 @@ def run(seed, args, verbose=False):
         # ---------------- mission ----------------
         if k % 40 == 0:
             tracker.merge_close()
+            if args.mission == 'new':
+                tracker.enforce_count(args.boards)
         if k % steps_per['mission'] == 0:
-            cands = []
-            for tr in tracker.inspect_candidates():
-                if tr.best()[0] == 'NOT_TARGET':
-                    continue
-                vp, n = tracker.viewpoint(tr, (est.x, est.y))
-                cands.append({'id': tr.id, 'x': float(tr.xy[0]), 'y': float(tr.xy[1]),
-                              'nx': float(n[0]), 'ny': float(n[1])})
+            if args.mission == 'new':
+                cands = tracker.mission_candidates(0.8, True)
+            else:
+                cands = []
+                for tr in tracker.inspect_candidates():
+                    if tr.best()[0] == 'NOT_TARGET':
+                        continue
+                    vp, n = tracker.viewpoint(tr, (est.x, est.y))
+                    cands.append({'id': tr.id, 'x': float(tr.xy[0]), 'y': float(tr.xy[1]),
+                                  'nx': float(n[0]), 'ny': float(n[1])})
             exit_info = {'allowed': tracker.allowed_exits() or stars.allowed()} \
                 if args.exit_rule == 'stars' else vote.info()
             new_route = mission.update(t, est, cands, tracker.summary(), exit_info, mats)
             for fb in mission.pop_feedback():
-                tr = tracker.get(fb['id'])
-                if tr is not None:
-                    tr.inspect_attempts += 1
-                    if fb['result'] == 'classified' or tr.inspect_attempts >= 2:
-                        tr.inspected = True
+                tracker.apply_feedback(fb, 2)
             if new_route != route:
                 route = new_route
                 path = planner.plan(est, route)
@@ -392,6 +425,9 @@ def run(seed, args, verbose=False):
         'err_est_max': round(float(np.max(err_est)), 2) if err_est else 0.0,
         'exit_colour': mission.exit_colour, 'exited_correct_gate': bool(exited),
         'inspect_time': round(mission.inspect_used, 1), 'details': details, 'events': mission.events,
+        'wrong': found - correct, 'all_found': found == len(lay['boards']), 'rows': rows,
+        'board_xy': [(b['cls'], round(b['x'], 1), round(b['y'], 1)) for b in lay['boards']],
+        'rechecks': sum(1 for e in mission.events if '] RECHECK (' in e),
         'path_len': round(sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(trail[:-1], trail[1:])), 1),
     }
     if args.plot:
@@ -457,6 +493,12 @@ def main():
     ap.add_argument('--classify-range', type=float, default=2.2)
     ap.add_argument('--confusion', type=float, default=0.15)
     ap.add_argument('--reverse', action='store_true')
+    ap.add_argument('--boards', type=int, default=12, help='cards on the course (the challenge has 12)')
+    ap.add_argument('--perception', default='recognizer', choices=['recognizer', 'old'],
+                    help='card reading model: the template recognizer (default) or the old ORB-range model')
+    ap.add_argument('--mission', default='new', choices=['new', 'old'],
+                    help='new: revisit/recheck/search until all cards; old: the earlier inspect rules')
+    ap.add_argument('--recog-wrong', type=float, default=0.02, help='recognizer: wrong-class rate per read')
     ap.add_argument('--wonky', action='store_true', help='badly behaved car: see tools/sim_car.py')
     ap.add_argument('--known-map', action='store_true', help='use the saved course map (KNOWN_MAP.md)')
     ap.add_argument('--shift', type=float, default=0.0, help='rebuilt course: obstacles moved up to this (m)')
@@ -488,6 +530,9 @@ def main():
             print('      boards:', r['details'])
     if len(results) > 1:
         n = float(len(results))
+        print('cards: all found in %d/%d runs, wrong class %d in total, false reports %d, rechecks %d' % (
+            sum(r['all_found'] for r in results), len(results), sum(r['wrong'] for r in results),
+            sum(r['false'] for r in results), sum(r['rechecks'] for r in results)))
         print('mean: found %.1f/%d, correct %.1f, bumps %.1f, exit OK %d/%d, time %.0f s, '
               'position error %.2f m (max %.2f; raw odometry %.2f, max %.2f)' % (
                   sum(r['found'] for r in results) / n, results[0]['boards'],

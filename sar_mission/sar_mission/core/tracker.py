@@ -41,6 +41,7 @@ class Track(object):
         self.side_vec = np.zeros(2)   # evidence for where the print faces (sum of sight directions)
         self.seen_vec = np.zeros(2)   # where we've mostly looked from
         self.logp = np.zeros(len(ALL_CLASSES))
+        self.psum = np.zeros(len(ALL_CLASSES))   # sum of per-reading probabilities (read quality)
         self.n_class_obs = 0
         self.n_obs = 1
         self.n_back = 0
@@ -48,6 +49,7 @@ class Track(object):
         self.last_seen = now
         self.inspected = False
         self.inspect_attempts = 0
+        self.rechecked = False       # one extra look at a low-confidence card (or unsure star)
         self.sight_dirs = []       # unit vectors from target to robot at each sighting
         self.star_votes = {}       # SAFE cards: star colour -> votes ('none' = no star)
         if normal is not None:
@@ -92,6 +94,15 @@ class Track(object):
         pr = self.probs()
         c = max(pr, key=pr.get)
         return c, pr[c]
+
+    def quality(self):
+        """How sure the individual readings were about the winning class: their average probability
+        for it (0..1). The combined posterior (best()) saturates after a few agreeing readings even when
+        each was only 60% sure; this doesn't, so it decides which confirmed cards get a recheck."""
+        if self.n_class_obs == 0:
+            return 0.0
+        c, _ = self.best()
+        return float(self.psum[ALL_CLASSES.index(c)] / self.n_class_obs)
 
     def star(self):
         """Most voted star colour, or None if never read."""
@@ -179,6 +190,7 @@ class TargetTracker(object):
             v = np.array([max(probs.get(c, 0.0), EPS) for c in ALL_CLASSES])
             v /= v.sum()
             t.logp += np.log(v)
+            t.psum += v
             t.n_class_obs += 1
         return t
 
@@ -190,31 +202,40 @@ class TargetTracker(object):
             for i in range(len(self.tracks)):
                 for j in range(i + 1, len(self.tracks)):
                     a, b = self.tracks[i], self.tracks[j]
-                    if float(np.hypot(*(a.xy - b.xy))) > radius:
+                    d = float(np.hypot(*(a.xy - b.xy)))
+                    # never-read sightings of one card (from far away or the map difference) drift
+                    # apart more than read ones: merge those a little more generously
+                    r = max(radius, 0.5) if (a.n_class_obs == 0 and b.n_class_obs == 0) else radius
+                    if d > r:
                         continue
                     if a.axis is not None and b.axis is not None and \
                             abs(float(np.dot(a.axis, b.axis))) < self.max_normal_cos:
                         continue
                     keep, drop = (a, b) if a.n_obs >= b.n_obs else (b, a)
-                    keep.sum_w += drop.sum_w
-                    keep.sum_wxy += drop.sum_wxy
-                    keep.logp += drop.logp
-                    keep.n_class_obs += drop.n_class_obs
-                    keep.n_obs += drop.n_obs
-                    keep.n_back += drop.n_back
-                    keep.first_seen = min(keep.first_seen, drop.first_seen)
-                    keep.sight_dirs += drop.sight_dirs
-                    keep.inspect_attempts = max(keep.inspect_attempts, drop.inspect_attempts)
-                    keep.axis_sum += drop.axis_sum
-                    keep.side_vec += drop.side_vec
-                    keep.seen_vec += drop.seen_vec
-                    for k, v in drop.star_votes.items():
-                        keep.star_votes[k] = keep.star_votes.get(k, 0) + v
-                    self.tracks.remove(drop)
+                    self._merge_into(keep, drop)
                     merged = True
                     break
                 if merged:
                     break
+
+    def _merge_into(self, keep, drop):
+        keep.sum_w += drop.sum_w
+        keep.sum_wxy += drop.sum_wxy
+        keep.logp += drop.logp
+        keep.psum += drop.psum
+        keep.n_class_obs += drop.n_class_obs
+        keep.n_obs += drop.n_obs
+        keep.n_back += drop.n_back
+        keep.first_seen = min(keep.first_seen, drop.first_seen)
+        keep.sight_dirs += drop.sight_dirs
+        keep.inspect_attempts = max(keep.inspect_attempts, drop.inspect_attempts)
+        keep.rechecked = keep.rechecked or drop.rechecked
+        keep.axis_sum += drop.axis_sum
+        keep.side_vec += drop.side_vec
+        keep.seen_vec += drop.seen_vec
+        for k, v in drop.star_votes.items():
+            keep.star_votes[k] = keep.star_votes.get(k, 0) + v
+        self.tracks.remove(drop)
 
     # ------------------------------------------------------------------------------------
     def confirmed(self, t):
@@ -239,6 +260,101 @@ class TargetTracker(object):
         else:
             n = np.array([1.0, 0.0])
         return t.xy + self.view_distance * n, n
+
+    def star_uncertain(self, t, min_votes=3, min_share=0.75):
+        """SAFE card whose star colour isn't settled yet (it decides the exit)."""
+        if t.best()[0] != 'SAFE':
+            return False
+        n = sum(t.star_votes.values())
+        return n < min_votes or max(t.star_votes.values()) < min_share * n
+
+    def revisit_dir(self, t, offsets_deg=(0, 35, -35, 60, -60)):
+        """Direction (unit vector from the card) to look at it from next time, as far as possible
+        from the directions it has already been seen from (a different view fixes most bad reads:
+        glare, a steep angle, something in the way). If we know which side is printed, stay in front
+        of it (straight-on wins ties); if not (never read, no back seen), any side, the unseen first."""
+        _, n = self.viewpoint(t)
+        base = math.atan2(n[1], n[0])
+        if t.n_class_obs == 0 and t.n_back == 0:
+            offsets_deg = (180, 0, 90, -90, 135, -135, 45, -45)
+        seen = [math.atan2(d[1], d[0]) for d in t.sight_dirs[-60:]]
+        best, best_score = None, None
+        for k, off in enumerate(offsets_deg):
+            a = base + math.radians(off)
+            gap = min([abs(math.atan2(math.sin(a - b), math.cos(a - b))) for b in seen] or [math.pi])
+            score = round(math.degrees(gap) / 15.0) - 0.01 * k      # 15-degree steps, then prefer order
+            if best is None or score > best_score:
+                best, best_score = a, score
+        return np.array([math.cos(best), math.sin(best)])
+
+    def mission_candidates(self, good_conf=0.8, recheck=True, min_obs=3):
+        """What the mission may go and look at:
+          'unread'  - seen but not confirmed yet (and not given up on)
+          'recheck' - confirmed, but below good_conf, or a SAFE card with an unsure star; once only.
+        Each: {id, x, y, nx, ny (direction to look from next: untried), fnx, fny (straight in front of
+        the printed face), kind, conf}."""
+        out = []
+        for t in self.inspect_candidates():
+            if t.best()[0] == 'NOT_TARGET' and t.n_class_obs > 0:
+                continue
+            if t.n_obs < min_obs:
+                continue            # a one-off sighting (noise) is not worth a trip
+            n = self.revisit_dir(t)
+            _, f = self.viewpoint(t)
+            out.append({'id': t.id, 'x': float(t.xy[0]), 'y': float(t.xy[1]), 'nx': float(n[0]),
+                        'ny': float(n[1]), 'fnx': float(f[0]), 'fny': float(f[1]),
+                        'kind': 'unread', 'conf': float(t.best()[1])})
+        if recheck:
+            for t in self.tracks:
+                if t.rechecked or not self.confirmed(t) or not self.is_target(t):
+                    continue
+                conf = t.quality()
+                if conf >= good_conf and not self.star_uncertain(t):
+                    continue
+                n = self.revisit_dir(t)
+                _, f = self.viewpoint(t)
+                out.append({'id': t.id, 'x': float(t.xy[0]), 'y': float(t.xy[1]), 'nx': float(n[0]),
+                            'ny': float(n[1]), 'fnx': float(f[0]), 'fny': float(f[1]),
+                            'kind': 'recheck', 'conf': float(conf)})
+        return out
+
+    def apply_feedback(self, fb, max_attempts=2):
+        """Mission feedback after a look: {'id', 'result', 'kind'}."""
+        t = self.get(fb['id'])
+        if t is None:
+            return
+        if fb.get('kind') == 'recheck':
+            t.rechecked = True
+            return
+        t.inspect_attempts += 1
+        if fb['result'] == 'classified' or t.inspect_attempts >= max_attempts:
+            t.inspected = True
+
+    def n_confirmed(self):
+        return sum(1 for t in self.tracks if self.confirmed(t) and self.is_target(t))
+
+    def enforce_count(self, expected):
+        """More classified cards than the course has: some are the same card counted twice (drift,
+        noisy far sightings). Merge close tracks of the SAME class until the count fits (cards of
+        different classes can stand 0.5 m apart, so those are never merged here)."""
+        if not expected:
+            return
+        for r in (0.5, 0.7):
+            cls = [t for t in self.tracks if t.n_class_obs > 0 and self.is_target(t)]
+            if len(cls) <= expected:
+                return
+            merged = True
+            while merged:
+                merged = False
+                for i, a in enumerate(cls):
+                    for b in cls[i + 1:]:
+                        if a.best()[0] == b.best()[0] and float(np.hypot(*(a.xy - b.xy))) <= r:
+                            self._merge_into(a, b) if a.n_obs >= b.n_obs else self._merge_into(b, a)
+                            cls = [t for t in self.tracks if t.n_class_obs > 0 and self.is_target(t)]
+                            merged = True
+                            break
+                    if merged:
+                        break
 
     def inspect_candidates(self):
         out = []
@@ -270,6 +386,7 @@ class TargetTracker(object):
                 'confirmed': bool(self.confirmed(t)), 'x': round(float(x), 2), 'y': round(float(y), 2),
                 'n_obs': t.n_obs, 'n_class_obs': t.n_class_obs, 'first_seen': round(t.first_seen, 1),
                 'inspected': t.inspected, 'star': t.star() if c == 'SAFE' else None,
+                'quality': round(t.quality(), 3), 'rechecked': t.rechecked,
             })
         return rows
 

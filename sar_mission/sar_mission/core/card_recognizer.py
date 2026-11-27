@@ -96,7 +96,7 @@ class CardResult(object):
 
 
 class CardRecognizer(object):
-    def __init__(self, ref_dir=None, refs=None, min_px=40, min_score=0.60, temperature=25.0,
+    def __init__(self, ref_dir=None, refs=None, min_px=40, min_score=0.60, temperature=9.0,
                  verify_px=120, use_features=True, levels=(140, 170, 200, 225), s_max=80,
                  blank_fraction=0.05, s_min=90, v_min=70, box_min_score=0.7,
                  work_height=720, hp_weight=4.5):

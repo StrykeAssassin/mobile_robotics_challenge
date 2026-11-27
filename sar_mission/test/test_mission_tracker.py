@@ -63,7 +63,7 @@ def test_inspect_detour_and_resume():
     # classified -> candidate disappears -> back to lanes, feedback emitted
     m.update(3.0, Pose2D(1.5, 1.0, 0.0), candidates=[])
     assert m.state == LANES
-    assert m.pop_feedback() == [{'id': 7, 'result': 'classified'}]
+    assert m.pop_feedback() == [{'id': 7, 'result': 'classified', 'kind': 'unread'}]
 
 
 def test_odometry_jump_pauses():

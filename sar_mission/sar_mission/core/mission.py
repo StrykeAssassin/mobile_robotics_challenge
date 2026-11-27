@@ -10,8 +10,16 @@ Inputs each update (all positions in the odom frame):
   mats          dict colour -> (x, y) of coloured floor mats seen so far (odom)
 Output: the route the planner should follow (list of odom points; [] = stop), plus events.
 
-MOPUP: after the lanes and the ring, if time is left before ring_end, go back to boards that
-were seen but not classified yet (nearest first), then exit.
+Cards (the challenge has expected_cards = 12 on the course):
+  * On the search route the car reads cards as it passes (the recognizer works from ~4 m). It only
+    stops for a card that is cheap to inspect (already lined up in front of it, or close and ahead);
+    others stay on the map as 'unread' and are revisited later.
+  * MOPUP, after the lanes and the ring: revisit 'unread' cards (nearest first) from a direction not
+    tried yet; then 'recheck' confirmed cards below good_conf (or SAFE cards with an unsure star),
+    lowest first, once each; then, while fewer than expected_cards are confirmed, drive another lap.
+    Each visit: one big move to the viewpoint, a short look, then at most one creep closer.
+  * Leave early once all expected_cards are confirmed, the rechecks are done and the exit is known.
+    Otherwise the timers decide (ring_end, forced_exit).
 Timers (from the moment the car first moves): lanes end at lanes_end, the ring at ring_end,
 forced exit at forced_exit, and everything stops at estop.
 """
@@ -43,7 +51,15 @@ class MissionParams(object):
         self.view_clear_radius = 0.9
         self.max_attempts = 2
         self.max_retries = 0             # extra go-rounds when arriving at an angle
-        self.min_targets_for_shortcut = 4
+        self.min_targets_for_shortcut = 4    # only used when expected_cards is 0 (unknown)
+        self.expected_cards = 12         # cards on the course; 0 = unknown (old early-exit rule)
+        self.good_conf = 0.8             # confirmed cards below this get one recheck (if time allows)
+        self.route_inspect = 'cheap'     # stop for cards on the route: 'cheap' only, or 'always' (old)
+        self.cheap_dist = 3.0            # 'cheap': card closer than this and roughly ahead
+        self.revisit_dwell = 3.0         # look this long at a revisit/recheck before creeping closer
+        self.creep = 0.5                 # fine correction: move this much closer, once
+        self.visit_extra = 15.0          # time cap of a revisit = estimated travel time + this
+        self.mopup_margin = 25.0         # no new visits this close to ring_end
         self.exit_approach_dist = 2.0
         self.gate_tolerance = 0.7
         self.gate_half_size = 1.2       # inside a 3 x 3 m zone with 0.3 m margin counts as exited
@@ -80,6 +96,7 @@ class MissionLogic(object):
         self.resume = None
         self.inspect_used = 0.0
         self.attempted = {}
+        self.last_try = {}
         self.exit_target = None
         self.exit_colour = None
         self.best_d = None
@@ -153,14 +170,35 @@ class MissionLogic(object):
             self._start_ring(now, pose, reason='lanes timer')
         if self.state in (RING, MOPUP) and t > p.ring_end:
             self._start_exit(now, pose, exit_info, mats, reason='ring timer')
+        if self.state == INSPECT and t > p.ring_end and self.resume and self.resume[0] in (RING, MOPUP):
+            # search time is over: don't finish a look on the way, go for the exit
+            self._finish_inspect(now, 'aborted (search time over)', pose)
+            self._start_exit(now, pose, exit_info, mats, reason='ring timer')
+
+        # --- progress ---------------------------------------------------------------------------
+        n_conf = sum(1 for r in targets if r.get('confirmed') and r.get('class') in TARGET_CLASSES)
+        if n_conf != getattr(self, '_n_conf', None):
+            self._n_conf = n_conf
+            unread = sum(1 for c in candidates if c.get('kind', 'unread') == 'unread')
+            self.log(now, 'cards confirmed %d/%s, unread candidates %d' % (
+                n_conf, p.expected_cards or '?', unread))
 
         # --- per state ---------------------------------------------------------------------
         if self.state in (LANES, RING):
-            if self._maybe_start_inspect(now, pose, candidates):
+            if p.route_inspect == 'always':
+                started = self._maybe_start_inspect(now, pose, candidates)
+            else:
+                started = self._maybe_start_inspect(now, pose, candidates, cheap_only=True)
+            if started:
                 return self.route
-            if self.state == RING and self._shortcut_ok(exit_info, mats, targets):
-                self._start_exit(now, pose, exit_info, mats, reason='all classes found and exit known')
+            if self._shortcut_ok(exit_info, mats, targets, candidates) and (self.state == RING or p.expected_cards):
+                self._start_exit(now, pose, exit_info, mats, reason=self._shortcut_reason())
                 return self.route
+            if p.expected_cards and n_conf >= p.expected_cards:
+                # every card found: skip the rest of the route and go straight to the rechecks
+                self.log(now, 'all %d cards confirmed: rechecks next' % p.expected_cards)
+                self._set_state(now, MOPUP, [])
+                return self.update(now, pose, candidates, targets, exit_info, mats)
             self._advance(now, pose)
             if self.idx >= len(self.route):
                 if self.state == LANES:
@@ -172,9 +210,24 @@ class MissionLogic(object):
             return self.route[self.idx:]
 
         if self.state == MOPUP:
-            if self._maybe_start_inspect(now, pose, candidates, max_dist=float('inf')):
+            if self._shortcut_ok(exit_info, mats, targets, candidates):
+                self._start_exit(now, pose, exit_info, mats, reason=self._shortcut_reason())
                 return self.route
-            self._start_exit(now, pose, exit_info, mats, reason='search finished')
+            # 1. cards seen but not read, nearest first, from a direction not tried yet
+            if self._maybe_start_inspect(now, pose, candidates, max_dist=float('inf'), kinds=('unread',)):
+                return self.route
+            # 2. one more look at low-confidence cards (and SAFE cards with an unsure star), lowest first
+            if self._maybe_start_inspect(now, pose, candidates, max_dist=float('inf'), kinds=('recheck',),
+                                         order='conf'):
+                return self.route
+            # 3. cards still missing: another lap while there's time
+            if p.expected_cards and n_conf < p.expected_cards and self.elapsed(now) < p.ring_end - 90.0:
+                self.laps = getattr(self, 'laps', 0) + 1
+                self._start_ring(now, pose, reason='%d/%d cards confirmed: extra lap %d' % (
+                    n_conf, p.expected_cards, self.laps))
+                return self.route
+            self._start_exit(now, pose, exit_info, mats, reason='search finished (%d/%s cards)' % (
+                n_conf, p.expected_cards or '?'))
             return self.route
 
         if self.state == INSPECT:
@@ -239,45 +292,70 @@ class MissionLogic(object):
         self._set_state(now, RING, [self.arena.to_odom(x, y) for x, y in ring])
 
     # --- inspect --------------------------------------------------------------------------
-    def _maybe_start_inspect(self, now, pose, candidates, max_dist=None):
+    def _maybe_start_inspect(self, now, pose, candidates, max_dist=None, kinds=('unread',), cheap_only=False,
+                             order='near'):
         p = self.p
         max_dist = p.inspect_max_dist if max_dist is None else max_dist
         t = self.elapsed(now)
-        if t > p.ring_end or self.inspect_used > p.inspect_budget:
+        if t > p.ring_end - (p.mopup_margin if self.state == MOPUP else 0.0) or self.inspect_used > p.inspect_budget:
             return False
-        best, best_d = None, None
+        best, best_key, best_d, best_lined = None, None, None, False
         for c in candidates:
-            if self.attempted.get(c['id'], 0) >= p.max_attempts:
+            kind = c.get('kind', 'unread')
+            if kind not in kinds:
                 continue
+            key_id = (c['id'], kind)
+            if self.attempted.get(key_id, 0) >= (p.max_attempts if kind == 'unread' else 1):
+                continue
+            if self.state != MOPUP and now - self.last_try.get(c['id'], -1e9) < 60.0:
+                continue          # just looked at it: carry on, try again later from elsewhere
+            if cheap_only and 'fnx' in c:
+                # a stop on the way: look from straight in front (where we're coming from), not from
+                # the untried direction a later revisit would use
+                c = dict(c, nx=c['fnx'], ny=c['fny'])
             d = math.hypot(c['x'] - pose.x, c['y'] - pose.y)
-            if d < p.view_distance - 0.2:
+            if d < p.view_distance - 0.2 and kind == 'unread' and not cheap_only:
                 continue          # already too close to get a proper look; we'd only creep closer
-            if d <= max_dist and (best is None or d < best_d):
-                if self.clear_fn is not None:
-                    vx = c['x'] + p.view_distance * c['nx']
-                    vy = c['y'] + p.view_distance * c['ny']
-                    if not self.clear_fn(vx, vy, p.view_clear_radius, (c['x'], c['y'])):
-                        self.attempted[c['id']] = self.attempted.get(c['id'], 0) + 1
-                        self.log(now, 'target %d: viewpoint cluttered, skipped' % c['id'])
-                        continue
-                best, best_d = c, d
+            if d > max_dist:
+                continue
+            lined = self._lined_up(pose, c, d)
+            if cheap_only:
+                ahead = abs(wrap(math.atan2(c['y'] - pose.y, c['x'] - pose.x) - pose.yaw)) < math.radians(40)
+                if not (lined or (d < p.cheap_dist and ahead and d > p.view_distance - 0.5)):
+                    continue
+            if self.clear_fn is not None:
+                vx = c['x'] + p.view_distance * c['nx']
+                vy = c['y'] + p.view_distance * c['ny']
+                if not self.clear_fn(vx, vy, p.view_clear_radius, (c['x'], c['y'])):
+                    self.attempted[key_id] = self.attempted.get(key_id, 0) + 1
+                    self.log(now, 'target %d: viewpoint cluttered, skipped' % c['id'])
+                    continue
+            key = (c.get('conf', 0.0), d) if order == 'conf' else (d,)
+            if best is None or key < best_key:
+                best, best_key, best_d, best_lined = c, key, d, lined
         if best is None:
             return False
+        kind = best.get('kind', 'unread')
         nx, ny = best['nx'], best['ny']
         view = self._clamp_inside(best['x'] + p.view_distance * nx, best['y'] + p.view_distance * ny)
         pre = self._clamp_inside(best['x'] + p.pre_distance * nx, best['y'] + p.pre_distance * ny)
-        # already lined up in front of the board, facing it: go straight to the viewpoint
-        to_board = math.atan2(best['y'] - pose.y, best['x'] - pose.x)
-        from_board = math.atan2(pose.y - best['y'], pose.x - best['x'])
-        lined_up = (abs(wrap(from_board - math.atan2(ny, nx))) < math.radians(35)
-                    and abs(wrap(to_board - pose.yaw)) < math.radians(35)
-                    and p.view_distance + 0.3 < best_d < p.pre_distance + 1.5)
-        route = [view] if lined_up else [pre, view]
-        self.attempted[best['id']] = self.attempted.get(best['id'], 0) + 1
+        route = [view] if best_lined else [pre, view]
+        key_id = (best['id'], kind)
+        self.attempted[key_id] = self.attempted.get(key_id, 0) + 1
+        self.last_try[best['id']] = now
         self.resume = (self.state, self.route, self.idx)
-        self.inspect = {'id': best['id'], 'start': now, 'phase': 'approach', 'view': view, 'pre': pre,
-                        'board': (best['x'], best['y']), 'dwell_start': None}
-        self.log(now, 'INSPECT target %d at (%.1f, %.1f), d=%.1f m' % (best['id'], best['x'], best['y'], best_d))
+        # time cap: an on-route stop gets inspect_cap; a revisit gets its travel time + visit_extra
+        if self.state == MOPUP:
+            travel = (math.hypot(pre[0] - pose.x, pre[1] - pose.y) + p.pre_distance) / 0.25
+            cap = min(travel + p.visit_extra, 90.0)
+        else:
+            cap = p.inspect_cap
+        self.inspect = {'id': best['id'], 'kind': kind, 'start': now, 'phase': 'approach', 'view': view,
+                        'pre': pre, 'normal': (nx, ny), 'board': (best['x'], best['y']), 'dwell_start': None,
+                        'cap': cap, 'crept': False,
+                        'dwell': p.inspect_dwell if p.route_inspect == 'always' else p.revisit_dwell}
+        what = {'unread': 'INSPECT', 'recheck': 'RECHECK (%.0f%%)' % (100 * best.get('conf', 0.0))}[kind]
+        self.log(now, '%s target %d at (%.1f, %.1f), d=%.1f m' % (what, best['id'], best['x'], best['y'], best_d))
         self.state_before_inspect = self.state
         self.state = INSPECT
         self.route = route
@@ -285,14 +363,23 @@ class MissionLogic(object):
         self.best_d = None
         return True
 
+    def _lined_up(self, pose, c, d):
+        """Already in front of the board's printed face and facing it: go straight to the viewpoint."""
+        p = self.p
+        to_board = math.atan2(c['y'] - pose.y, c['x'] - pose.x)
+        from_board = math.atan2(pose.y - c['y'], pose.x - c['x'])
+        return (abs(wrap(from_board - math.atan2(c['ny'], c['nx']))) < math.radians(35)
+                and abs(wrap(to_board - pose.yaw)) < math.radians(35)
+                and p.view_distance + 0.3 < d < p.pre_distance + 1.5)
+
     def _update_inspect(self, now, pose, candidates):
         p = self.p
         ins = self.inspect
-        still_needed = any(c['id'] == ins['id'] for c in candidates)
+        still_needed = any(c['id'] == ins['id'] and c.get('kind', 'unread') == ins['kind'] for c in candidates)
         if not still_needed:
             self._finish_inspect(now, 'classified', pose)
             return self.route[self.idx:]
-        if now - ins['start'] > p.inspect_cap:
+        if now - ins['start'] > ins['cap']:
             self._finish_inspect(now, 'timeout', pose)
             return self.route[self.idx:]
         if ins['phase'] == 'approach':
@@ -301,7 +388,7 @@ class MissionLogic(object):
             close = math.hypot(pose.x - vx, pose.y - vy) < p.view_tolerance
             facing = abs(wrap(math.atan2(by - pose.y, bx - pose.x) - pose.yaw)) < math.radians(45)
             # don't drive into the board: stop if we are already nearer than the viewpoint
-            too_close = math.hypot(pose.x - bx, pose.y - by) < p.view_distance - 0.2
+            too_close = math.hypot(pose.x - bx, pose.y - by) < (p.view_distance - (p.creep if ins['crept'] else 0.0)) - 0.2
             if (close or too_close) and facing:
                 ins['phase'] = 'dwell'
                 ins['dwell_start'] = now
@@ -318,8 +405,21 @@ class MissionLogic(object):
                 return self.route
             self._advance(now, pose, final_tolerance=p.view_tolerance)
             return self.route[self.idx:] if self.idx < len(self.route) else []
-        # dwell: stopped in front of the board while the classifier collects frames
-        if now - ins['dwell_start'] > p.inspect_dwell:
+        # dwell: stopped in front of the board while the recognizer collects frames
+        if now - ins['dwell_start'] > ins['dwell']:
+            bx, by = ins['board']
+            d = math.hypot(pose.x - bx, pose.y - by)
+            if not ins['crept'] and p.creep > 0 and d > p.view_distance - p.creep + 0.2:
+                # fine correction: creep straight in, closer to the card, and look again
+                nx, ny = ins['normal']
+                ins['crept'] = True
+                ins['view'] = self._clamp_inside(bx + (p.view_distance - p.creep) * nx,
+                                                 by + (p.view_distance - p.creep) * ny)
+                ins['phase'] = 'approach'
+                self.route = [ins['view']]
+                self.idx = 0
+                self.log(now, 'INSPECT target %d: not sure yet, creeping closer' % ins['id'])
+                return self.route
             self._finish_inspect(now, 'dwell over', pose)
             return self.route[self.idx:]
         return []
@@ -345,8 +445,10 @@ class MissionLogic(object):
             return
         self.inspect_used += now - self.inspect['start']
         self.events_feedback = getattr(self, 'events_feedback', [])
-        self.events_feedback.append({'id': self.inspect['id'], 'result': result})
-        self.log(now, 'INSPECT target %d done: %s' % (self.inspect['id'], result))
+        self.events_feedback.append({'id': self.inspect['id'], 'result': result,
+                                     'kind': self.inspect.get('kind', 'unread')})
+        self.log(now, '%s target %d done: %s' % ('RECHECK' if self.inspect.get('kind') == 'recheck' else 'INSPECT',
+                                                 self.inspect['id'], result))
         self.inspect = None
         state, route, idx = self.resume
         self.resume = None
@@ -362,7 +464,7 @@ class MissionLogic(object):
         return fb
 
     # --- exit -----------------------------------------------------------------------------
-    def _shortcut_ok(self, exit_info, mats, targets):
+    def _shortcut_ok(self, exit_info, mats, targets, candidates=()):
         if not exit_info:
             return False
         allowed = [c for c in (exit_info.get('allowed') or []) if c in mats or c in self.gates_arena]
@@ -370,8 +472,18 @@ class MissionLogic(object):
         if not allowed and not (colour and (colour in mats or colour in self.gates_arena)):
             return False
         confirmed = [r for r in targets if r.get('confirmed') and r.get('class') in TARGET_CLASSES]
+        if self.p.expected_cards:
+            # all cards found, and the low-confidence ones looked at again (or given up on)
+            pending = [c for c in candidates if c.get('kind') == 'recheck'
+                       and self.attempted.get((c['id'], 'recheck'), 0) < 1]
+            return len(confirmed) >= self.p.expected_cards and not pending
         classes = set(r['class'] for r in confirmed)
         return len(confirmed) >= self.p.min_targets_for_shortcut and classes >= set(TARGET_CLASSES)
+
+    def _shortcut_reason(self):
+        if self.p.expected_cards:
+            return 'all %d cards confirmed and exit known' % self.p.expected_cards
+        return 'all classes found and exit known'
 
     def _gate_xy(self, colour, mats):
         if colour in mats:

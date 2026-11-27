@@ -5,19 +5,39 @@ One ROS 2 package for the 50.047 search and rescue challenge. It runs:
 - in **Gazebo** on the laptop (WSL2 Ubuntu 22.04, ROS 2 Humble), using a TurtleBot3 restricted to drive like the car;
 - in a **plain-Python simulator** that needs no ROS at all (`tools/offline_sim.py`).
 
-The plan is the Phase 1 "Lanes + Ring" strategy:
-1. Drive 3 lawnmower lanes through the 10 × 10 m search area.
-2. Drive a loop 3 m inside the arena edge.
-3. Go back to any board that was seen but not classified (mop-up).
-4. Drive to the nearest exit whose colour matches a star on a SAFE card found (`exit_rule: stars`; the
-   older single-exit-sign rule is still there as `exit_rule: sign`).
+The plan is the Phase 1 "Lanes + Ring" strategy, adapted to the 12 cards on the course:
+1. Drive 3 lawnmower lanes through the 10 × 10 m search area, then a loop 3 m inside the arena edge.
+   Cards are read on the way (the card recognizer works from ~4 m). The car only stops for a card
+   that is cheap to look at (lined up in front of it, or close and ahead); others stay on the map.
+2. Mop-up: revisit cards seen but not read, from a direction not tried yet (one big move, a short look,
+   at most one creep closer); then give confirmed cards whose readings averaged under 80% one more
+   look, lowest first (SAFE cards with an unsure star too); then, while fewer than 12 are confirmed,
+   drive another lap.
+3. Leave as soon as all 12 cards are confirmed, rechecked and the exit is known; otherwise the timers
+   decide (search ends 15:00, forced exit 17:00). Exit: the nearest one whose colour matches a star on
+   a SAFE card (`exit_rule: stars`; the older single-exit-sign rule is still there as `exit_rule: sign`).
+Settings: `expected_cards`, `good_conf`, `route_inspect` and friends in `config/car.yaml`.
+
+Simulator, 12 cards, saved map, course rebuilt with pieces moved up to 20 cm, 10 layouts each
+(`tools/offline_sim.py --seeds 0-9 --known-map --shift 0.2 [--wonky] [--reverse] [--mission old]`):
+
+| Car | Cards found (of 12), old → new | All 12 found | Wrong class | Duplicate reports | Correct exit | Run time |
+|---|---|---|---|---|---|---|
+| Wonky, can reverse | 8.9 → **10.5** | 0 → 2 runs | 4 → 6 | 12 → 0 | 10 → 10 | 534 → 931 s |
+| Good steering, can reverse | 9.6 → **10.2** | 0 → 1 | 5 → 4 | 13 → 1 | 10 → 10 | 558 → 911 s |
+| Wonky, no reverse | 6.9 → **9.8** | 0 → 2 | 4 → 6 | 18 → 0 | 7 → 8 | 720 → 987 s |
+
+"Old" stopped at every card and left once it had 4 cards of all four classes. The new rules use the
+time until 15:00 when cards are missing, which is why runs are longer. Missed cards are mostly two
+cards of the same class standing within ~0.5 m (counted as one) and cards whose printed side faces
+an obstacle.
 
 **Known-map mode** (KNOWN_MAP.md): give the saved course map (`prior_map:=...`) and the robot localizes
 against it, plans around mapped obstacles, finds new objects by map difference and adds viewpoints
 where the map says the route can't see. Built for a course that is rebuilt every day (pieces moved
 10-30 cm).
 
-At each board the car stops 1.5 m in front of the printed side and classifies it over several frames. Targets are reported in the arena frame: origin at the SW corner, x east, y north, in metres.
+A card is confirmed after several agreeing readings (`target_tracker`: at least 3, combined confidence 70%). Targets are reported in the arena frame: origin at the SW corner, x east, y north, in metres.
 
 ## How it fits together
 

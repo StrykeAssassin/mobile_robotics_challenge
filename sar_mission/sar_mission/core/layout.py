@@ -44,11 +44,15 @@ def generate(seed=0, n_obstacles=10, n_boards=8, search_min=5.0, search_max=15.0
     rng.shuffle(classes)
     # make sure THREAT stands near a HOSTAGE (brief: 'standing near hostage')
     tries = 0
+    this_board = 0                      # attempts for the current board
     while len(boards) < n_boards and tries < 5000:
         tries += 1
+        this_board += 1
         cls = classes[len(boards)]
         lean = (len(boards) % 2 == 0) and obstacles
-        if cls == 'THREAT' and any(b['cls'] == 'HOSTAGE' for b in boards):
+        # (a THREAT that finds no room next to the first HOSTAGE, e.g. the 3rd THREAT of 12 cards,
+        # is placed like any other card after 60 tries)
+        if cls == 'THREAT' and any(b['cls'] == 'HOSTAGE' for b in boards) and this_board <= 60:
             host = [b for b in boards if b['cls'] == 'HOSTAGE'][0]
             ang = host['yaw'] + math.pi / 2 * (1 if rng.rand() < 0.5 else -1)
             x = host['x'] + 0.5 * math.cos(ang)
@@ -75,6 +79,7 @@ def generate(seed=0, n_obstacles=10, n_boards=8, search_min=5.0, search_max=15.0
                             for o in obstacles):
             continue
         boards.append({'cls': cls, 'x': float(x), 'y': float(y), 'yaw': float(yaw), 'lean': bool(lean)})
+        this_board = 0
 
     hosts = [o for o in obstacles if o['type'] in ('crate', 'box', 'long_box')]
     o = hosts[rng.randint(len(hosts))] if hosts else {'x': 10.0, 'y': 10.0, 'h': 0.0}

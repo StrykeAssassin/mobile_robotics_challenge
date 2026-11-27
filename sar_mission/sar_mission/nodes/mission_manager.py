@@ -55,7 +55,9 @@ class MissionManager(Node):
         self.allowed_from_cards = []
         names = ['lanes_end', 'ring_end', 'forced_exit', 'estop', 'inspect_max_dist', 'inspect_cap',
                  'inspect_budget', 'inspect_dwell', 'view_distance', 'pre_distance', 'gate_tolerance',
-                 'gate_half_size', 'min_targets_for_shortcut', 'jump_threshold', 'wp_block_time']
+                 'gate_half_size', 'min_targets_for_shortcut', 'jump_threshold', 'wp_block_time',
+                 'expected_cards', 'good_conf', 'route_inspect', 'cheap_dist', 'revisit_dwell', 'creep',
+                 'visit_extra', 'mopup_margin']
         defaults = MissionParams()
         kw = dict((n, type(getattr(defaults, n))(U.param(self, n, getattr(defaults, n)))) for n in names)
         kw['start_on'] = U.param(self, 'start_on', 'motion')

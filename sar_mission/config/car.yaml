@@ -92,6 +92,14 @@ mission_manager:
     ring_end: 900.0
     forced_exit: 1020.0
     estop: 1170.0
+    expected_cards: 12          # cards on the course: leave early only when all are confirmed (0 = unknown)
+    good_conf: 0.8              # confirmed cards below this get one more look, if time allows
+    route_inspect: "cheap"      # stop for a card on the route only if lined up / close ahead ("always" = old)
+    cheap_dist: 3.0
+    revisit_dwell: 3.0          # seconds of looking at a revisit before creeping closer
+    creep: 0.5                  # the one fine correction: this much closer (m)
+    visit_extra: 15.0           # a revisit may take its travel time + this
+    mopup_margin: 25.0          # no new revisits this close to ring_end
 
 target_tracker:
   ros__parameters:
@@ -100,8 +108,11 @@ target_tracker:
     camera_info_topic: "/zed/zed_node/depth/camera_info"
     use_zed_objects: false      # true = ZED person detection as a backup position source
     csv_path: "~/sar_targets.csv"
-    accept_conf: 0.7
+    accept_conf: 0.7            # a card counts as confirmed from here (and >= min_class_obs readings)
     min_class_obs: 3
+    expected_cards: 12          # same as mission_manager: duplicates are merged above this count
+    good_conf: 0.8              # same as mission_manager: below this a confirmed card is rechecked once
+    recheck: true
 
 exit_detector:
   ros__parameters:

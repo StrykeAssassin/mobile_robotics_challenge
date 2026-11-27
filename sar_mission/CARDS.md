@@ -14,7 +14,13 @@ needed: it compares what the camera sees with photos of the real cards in `cards
 | Classify | Straighten the card to 48x64 px and correlate it with every reference (colour + fine detail), after nudging the corners to fit. Below `min_score` (0.60) it's not a card. | `CardRecognizer.classify_region` |
 | Check | Big cards (≥ 120 px): the ORB feature matcher double-checks. | `core/card_matcher.py` |
 | Star | Top-right box of the straightened card, white-balanced on its own paper; hue picks red / yellow / green / blue, else `none`. | `star_from_card` |
-| Decide | The tracker votes over many frames before confirming a card. | `core/tracker.py` |
+| Decide | The tracker votes over many frames before confirming a card (3+ readings, 70% combined). | `core/tracker.py` |
+| Recheck | A confirmed card whose readings averaged under 80% (or a SAFE card with an unsure star) gets one more look from a new direction, if time allows. | `core/mission.py` |
+
+**Confidence values.** Each reading's class probabilities come from the template scores with
+`temperature` 9: a clear match gives about 0.9-0.97, a narrow or weak one 0.6-0.85 (about 1 reading
+in 7 on the synthetic test). The mission's recheck rule uses the average of these per reading, not the
+combined value, which reaches 99% after a few agreeing readings even when each was only 60% sure.
 
 ## Synthetic test results
 
